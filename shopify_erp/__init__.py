@@ -1,0 +1,1 @@
+# Shopify ERP Manager package
