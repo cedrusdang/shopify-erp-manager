@@ -4,7 +4,7 @@ from unittest.mock import patch
 from shopify_erp import api
 
 
-class TestApiGraphqlHelpers(unittest.TestCase):
+class TestApiRestHelpers(unittest.TestCase):
     def test_to_gid_and_gid_tail(self):
         self.assertEqual(api._to_gid("Product", "123"), "gid://shopify/Product/123")
         self.assertEqual(api._to_gid("Product", "gid://shopify/Product/999"), "gid://shopify/Product/999")
