@@ -125,3 +125,11 @@ class FieldSelector(ttk.Frame):
 
     def get_selected(self) -> list[str]:
         return [f for f, v in self._vars.items() if v.get()]
+
+    def set_selected(self, selected_fields: list[str]) -> None:
+        selected = set(selected_fields)
+        for f, v in self._vars.items():
+            if f in self._req:
+                v.set(True)
+            else:
+                v.set(f in selected)

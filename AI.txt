@@ -1,0 +1,14 @@
+AI Assistant Notes
+
+Model used: GPT-5.3-Codex.
+
+This repository was updated with AI assistance for:
+- Shopify GraphQL-first product data flows.
+- UI features (download scopes, upload field selection, image tools, live DB paging).
+- Safety/confirmation and Help text updates.
+- Automated tests in tests/test_api_graphql.py.
+
+Before production deployment:
+- Validate against a staging Shopify store.
+- Review GraphQL mutation error logs for variant/media edge cases.
+- Keep API versioning and migration notes up to date.

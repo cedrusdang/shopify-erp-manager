@@ -68,7 +68,7 @@ class BackupTab(ttk.Frame):
         backups = list_backups()
         bk      = backups[sel[0]]
         target  = self._app.current_xlsx()
-        if self._app.confirm(
+        if self._app.confirm_danger(
             "Confirm Rollback",
             f"Restore backup:\n{bk.name}\n\n"
             f"→  {target.resolve()}\n\n"

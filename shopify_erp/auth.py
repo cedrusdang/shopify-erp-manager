@@ -10,7 +10,7 @@ CRED_FILE = Path("credentials.txt")
 
 def _init_credentials() -> None:
     if not CRED_FILE.exists():
-        CRED_FILE.write_text("admin:admin\n", encoding="utf-8")
+        CRED_FILE.write_text("admin:Ready to begin ?\n", encoding="utf-8")
 
 
 def load_credentials() -> dict[str, str]:

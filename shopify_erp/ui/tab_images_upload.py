@@ -1,0 +1,540 @@
+"""Dedicated tab for uploading images to Shopify by SKU from local folder."""
+
+from __future__ import annotations
+
+import base64
+import re
+import threading
+import time
+from urllib.parse import urlparse
+from pathlib import Path
+from tkinter import scrolledtext
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import openpyxl
+import requests
+
+from ..api import update_product_api
+from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR
+
+
+class ImagesUploadTab(ttk.Frame):
+    def __init__(self, parent: ttk.Notebook, app):
+        super().__init__(parent)
+        self._app = app
+        self._running = False
+        self._headers: list[str] = []
+        self._build()
+
+    def _build(self) -> None:
+        ttk.Label(
+            self,
+            text="Images Tools — download / upload / scan / delete by SKU",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#0f6b45",
+        ).pack(anchor=tk.W, padx=10, pady=(10, 6))
+
+        info = ttk.LabelFrame(self, text=" Rules ", padding=8)
+        info.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(
+            info,
+            text=(
+                f"• Database file: {DATABASE_FILE}\n"
+                f"• Image folder: {IMAGE_DIR}\n"
+                "• Download: choose image URL field(s) from DB.\n"
+                "• Upload mode 1: local files with SKU prefix are sent to Shopify.\n"
+                "• Upload mode 2: send image URLs directly from DB fields (no local pre-download).\n"
+                "• A text manifest image_sources.txt is written in image folder."
+            ),
+            justify=tk.LEFT,
+            foreground="#444",
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W)
+
+        field_row = ttk.Frame(self)
+        field_row.pack(fill=tk.X, padx=8, pady=(4, 2))
+        ttk.Label(field_row, text="Image URL Field:").pack(side=tk.LEFT)
+        self._field_mode = tk.StringVar(value="All image src fields")
+        self._field_mode_combo = ttk.Combobox(
+            field_row,
+            textvariable=self._field_mode,
+            state="readonly",
+            values=["All image src fields", "Single field"],
+            width=22,
+        )
+        self._field_mode_combo.pack(side=tk.LEFT, padx=(6, 6))
+        self._field_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_field_mode())
+
+        self._field_pick = tk.StringVar(value="")
+        self._field_combo = ttk.Combobox(field_row, textvariable=self._field_pick, state="readonly", width=36)
+        self._field_combo.pack(side=tk.LEFT, padx=(0, 6), fill=tk.X, expand=True)
+        ttk.Button(field_row, text="Refresh Fields", command=self._refresh_fields).pack(side=tk.LEFT)
+
+        upload_mode_row = ttk.Frame(self)
+        upload_mode_row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        ttk.Label(upload_mode_row, text="Upload Source:").pack(side=tk.LEFT)
+        self._upload_mode = tk.StringVar(value="Local files by SKU")
+        self._upload_mode_combo = ttk.Combobox(
+            upload_mode_row,
+            textvariable=self._upload_mode,
+            state="readonly",
+            values=["Local files by SKU", "DB URL field(s)"],
+            width=22,
+        )
+        self._upload_mode_combo.pack(side=tk.LEFT, padx=(6, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(
+            btns,
+            text="Download Images",
+            style="Primary.TButton",
+            command=self._start_download_images,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            btns,
+            text="Upload Images by SKU",
+            style="Primary.TButton",
+            command=self._start,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Scan Folder Coverage", command=self._scan_folder_coverage).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Delete Selected SKU Images", command=self._delete_selected_images).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Open Image Folder", command=self._open_folder).pack(side=tk.LEFT)
+
+        self._stats = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._stats, foreground="#333").pack(anchor=tk.W, padx=10, pady=(0, 4))
+
+        self._prog = ttk.Progressbar(self, mode="determinate")
+        self._prog.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        ttk.Label(self, text="Folder Coverage (from DB rows):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
+        table_wrap = ttk.Frame(self)
+        table_wrap.pack(fill=tk.BOTH, expand=False, padx=8, pady=(2, 6))
+        self._tree = ttk.Treeview(
+            table_wrap,
+            columns=("id", "sku", "status", "files", "urls"),
+            show="headings",
+            height=8,
+        )
+        self._tree.heading("id", text="Product ID")
+        self._tree.heading("sku", text="SKU")
+        self._tree.heading("status", text="Folder Status")
+        self._tree.heading("files", text="Local Files")
+        self._tree.heading("urls", text="URL Count")
+        self._tree.column("id", width=120, anchor=tk.W)
+        self._tree.column("sku", width=180, anchor=tk.W)
+        self._tree.column("status", width=120, anchor=tk.CENTER)
+        self._tree.column("files", width=90, anchor=tk.CENTER)
+        self._tree.column("urls", width=90, anchor=tk.CENTER)
+        ysb = ttk.Scrollbar(table_wrap, orient=tk.VERTICAL, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=ysb.set)
+        self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(self, text="Images Upload Log:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
+        self._log_box = scrolledtext.ScrolledText(self, state="disabled", font=("Consolas", 8))
+        self._log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        self._refresh_fields()
+        self._sync_field_mode()
+
+    def _log(self, msg: str) -> None:
+        self._app.log(self._log_box, msg)
+
+    def _safe_sku(self, value: str) -> str:
+        sku = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+        return sku[:80] or DEFAULT_SKU
+
+    def _field_suffix(self, field_name: str) -> str:
+        m = re.match(r"^images\.(\d+)\.src$", field_name)
+        if m:
+            return f"img_{m.group(1)}"
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", (field_name or "").strip())
+        return clean[:40] or "img"
+
+    def _sku_files(self, sku: str) -> list[Path]:
+        folder = Path(IMAGE_DIR)
+        if not folder.exists():
+            return []
+        prefix = self._safe_sku(sku)
+        return sorted([p for p in folder.glob(f"{prefix}*.*") if p.is_file()])
+
+    def _image_payload_for_sku(self, sku: str) -> list[dict]:
+        files = self._sku_files(sku)
+        payload = []
+        for p in files:
+            try:
+                encoded = base64.b64encode(p.read_bytes()).decode("ascii")
+                payload.append({"attachment": encoded, "filename": p.name})
+            except Exception:
+                continue
+        return payload
+
+    def _load_db(self) -> tuple[list[str], list[tuple]]:
+        db = Path(DATABASE_FILE)
+        if not db.exists():
+            raise FileNotFoundError(f"Cannot find {DATABASE_FILE}")
+        wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return [], []
+        headers = [str(h or "").strip() for h in rows[0]]
+        return headers, rows[1:]
+
+    def _image_src_fields(self, headers: list[str]) -> list[str]:
+        out: list[str] = []
+        for h in headers:
+            if re.match(r"^images\.\d+\.src$", h):
+                out.append(h)
+            elif "image" in h.lower() and h.lower().endswith(".src"):
+                out.append(h)
+        return out
+
+    def _sync_field_mode(self) -> None:
+        single = self._field_mode.get() == "Single field"
+        self._field_combo.configure(state="readonly" if single else "disabled")
+
+    def _refresh_fields(self) -> None:
+        try:
+            headers, _ = self._load_db()
+        except Exception as exc:
+            self._log(f"Field refresh error: {exc}")
+            return
+        self._headers = headers
+        fields = self._image_src_fields(headers)
+        self._field_combo["values"] = fields
+        if fields and self._field_pick.get() not in fields:
+            self._field_pick.set(fields[0])
+
+    def _selected_image_fields(self, headers: list[str]) -> list[str]:
+        all_fields = self._image_src_fields(headers)
+        if self._field_mode.get() == "Single field":
+            f = self._field_pick.get().strip()
+            return [f] if f in all_fields else []
+        return all_fields
+
+    def _row_image_urls(self, row: tuple, headers: list[str], src_fields: list[str]) -> list[str]:
+        urls: list[str] = []
+        for f in src_fields:
+            try:
+                fi = headers.index(f)
+            except ValueError:
+                continue
+            if fi < len(row) and row[fi] not in (None, ""):
+                url = str(row[fi]).strip()
+                if url.lower().startswith("http://") or url.lower().startswith("https://"):
+                    urls.append(url)
+        return urls
+
+    def _write_manifest(self, lines: list[str]) -> Path:
+        folder = Path(IMAGE_DIR)
+        folder.mkdir(exist_ok=True)
+        manifest = folder / "image_sources.txt"
+        text = "filename\tproduct_id\tsku\tfield\tsource_url\n" + "\n".join(lines)
+        manifest.write_text(text + "\n", encoding="utf-8")
+        return manifest
+
+    def _start_download_images(self) -> None:
+        if self._running:
+            messagebox.showwarning("Busy", "Another image task is running.", parent=self)
+            return
+
+        if not self._app.confirm_danger(
+            "Confirm Images Download",
+            "Download images from selected DB image field(s) into local folder now?",
+        ):
+            return
+
+        self._running = True
+
+        def task():
+            self._app.start_prog("indeterminate")
+            self._log("Starting image download from DB fields…")
+            ok_count = fail_count = skip_count = 0
+            manifest_lines: list[str] = []
+
+            try:
+                headers, data_rows = self._load_db()
+                if not headers:
+                    self._log("Database is empty.")
+                    return
+
+                id_idx = headers.index("id") if "id" in headers else -1
+                sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
+                src_fields = self._selected_image_fields(headers)
+                if not src_fields:
+                    self._log("No image src fields selected/found.")
+                    return
+
+                field_indices = [headers.index(f) for f in src_fields]
+                total = len(data_rows)
+                self._prog.configure(maximum=max(total, 1), value=0)
+                self._app.start_prog("determinate")
+
+                folder = Path(IMAGE_DIR)
+                folder.mkdir(exist_ok=True)
+
+                for i, row in enumerate(data_rows, start=1):
+                    product_id = ""
+                    if id_idx >= 0 and id_idx < len(row) and row[id_idx] not in (None, ""):
+                        product_id = str(row[id_idx]).strip()
+
+                    sku = ""
+                    if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, ""):
+                        sku = str(row[sku_idx]).strip()
+                    if not sku:
+                        sku = DEFAULT_SKU
+                    safe_sku = self._safe_sku(sku)
+
+                    row_urls: list[tuple[str, str]] = []
+                    for fi, f in zip(field_indices, src_fields):
+                        if fi < len(row) and row[fi] not in (None, ""):
+                            url = str(row[fi]).strip()
+                            if url.lower().startswith("http://") or url.lower().startswith("https://"):
+                                row_urls.append((f, url))
+
+                    if not row_urls:
+                        skip_count += 1
+                        self._prog["value"] = i
+                        continue
+
+                    for field_name, url in row_urls:
+                        try:
+                            ext = Path(urlparse(url).path).suffix.lower()
+                            if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+                                ext = ".jpg"
+                            suffix = self._field_suffix(field_name)
+                            file_name = f"{safe_sku}_{suffix}{ext}"
+                            target = folder / file_name
+                            k = 2
+                            while target.exists():
+                                target = folder / f"{safe_sku}_{suffix}_{k}{ext}"
+                                k += 1
+                            file_name = target.name
+                            resp = requests.get(url, timeout=30)
+                            resp.raise_for_status()
+                            target.write_bytes(resp.content)
+                            manifest_lines.append(
+                                f"{file_name}\t{product_id}\t{sku}\t{field_name}\t{url}"
+                            )
+                            ok_count += 1
+                        except Exception as exc:
+                            fail_count += 1
+                            self._log(f"Download fail ID {product_id} SKU {sku}: {exc}")
+
+                    self._prog["value"] = i
+                    self._stats.set(
+                        f"Row {i}/{total}  DOWN_OK:{ok_count}  DOWN_FAIL:{fail_count}  SKIP:{skip_count}"
+                    )
+
+                manifest = self._write_manifest(manifest_lines)
+                self._log(f"Manifest written: {manifest}")
+                self._log(f"Download done. OK:{ok_count} FAIL:{fail_count} SKIP:{skip_count}")
+                self._app.set_status("Images download completed")
+                self._scan_folder_coverage()
+            except Exception as exc:
+                self._log(f"ERROR: {exc}")
+                self._app.set_status("Images download failed")
+                messagebox.showerror("Images Download Error", str(exc), parent=self)
+            finally:
+                self._running = False
+                self._app.stop_prog()
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _scan_folder_coverage(self) -> None:
+        try:
+            headers, data_rows = self._load_db()
+        except Exception as exc:
+            self._log(f"Scan error: {exc}")
+            return
+
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+
+        if not headers:
+            self._stats.set("Database is empty")
+            return
+
+        id_idx = headers.index("id") if "id" in headers else -1
+        sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
+        src_fields = self._selected_image_fields(headers)
+        src_idx = [headers.index(f) for f in src_fields]
+
+        has_count = 0
+        miss_count = 0
+        for i, row in enumerate(data_rows, start=1):
+            product_id = str(row[id_idx]).strip() if id_idx >= 0 and id_idx < len(row) and row[id_idx] not in (None, "") else ""
+            sku = str(row[sku_idx]).strip() if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, "") else DEFAULT_SKU
+            files = self._sku_files(sku)
+            url_count = 0
+            for fi in src_idx:
+                if fi < len(row) and row[fi] not in (None, ""):
+                    u = str(row[fi]).strip().lower()
+                    if u.startswith("http://") or u.startswith("https://"):
+                        url_count += 1
+            status = "HAS" if files else "MISSING"
+            if files:
+                has_count += 1
+            else:
+                miss_count += 1
+            self._tree.insert(
+                "",
+                tk.END,
+                iid=str(i),
+                values=(product_id, sku, status, str(len(files)), str(url_count)),
+            )
+
+        self._stats.set(f"Coverage: HAS {has_count} | MISSING {miss_count} | Rows {len(data_rows)}")
+        self._log(f"Coverage scan done: HAS {has_count}, MISSING {miss_count}, rows {len(data_rows)}")
+
+    def _delete_selected_images(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select row(s) in coverage table first.", parent=self)
+            return
+
+        if not self._app.confirm_danger(
+            "Delete Local Images",
+            f"Delete local image files for {len(sel)} selected SKU row(s)?",
+        ):
+            return
+
+        removed = 0
+        for iid in sel:
+            vals = self._tree.item(iid, "values")
+            sku = str(vals[1]) if len(vals) > 1 else ""
+            for f in self._sku_files(sku):
+                try:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+
+        self._log(f"Deleted {removed} local image file(s) from selected rows.")
+        self._scan_folder_coverage()
+
+    def _open_folder(self) -> None:
+        folder = Path(IMAGE_DIR)
+        folder.mkdir(exist_ok=True)
+        self._app.set_status(f"Image folder ready: {folder.resolve()}")
+        try:
+            import os
+            os.startfile(str(folder.resolve()))
+        except Exception:
+            messagebox.showinfo("Folder", f"Image folder: {folder.resolve()}", parent=self)
+
+    def _start(self) -> None:
+        if self._running:
+            messagebox.showwarning("Busy", "Another image task is running.", parent=self)
+            return
+
+        store, token = self._app.get_conn()
+        if not store:
+            return
+
+        db = Path(DATABASE_FILE)
+        if not db.exists():
+            messagebox.showwarning("Database Missing", f"Cannot find {DATABASE_FILE}", parent=self)
+            return
+
+        if not self._app.confirm_danger(
+            "Confirm Images Upload",
+            "Upload local images by SKU to Shopify now?",
+        ):
+            return
+
+        self._running = True
+
+        def task():
+            self._app.start_prog("indeterminate")
+            self._log("Starting images upload by SKU…")
+            ok_count = fail_count = skip_count = 0
+
+            try:
+                wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
+                ws = wb.active
+                rows = list(ws.iter_rows(values_only=True))
+                if not rows:
+                    self._log("Database is empty.")
+                    return
+
+                headers = [str(h or "").strip() for h in rows[0]]
+                data_rows = rows[1:]
+                total = len(data_rows)
+                self._prog.configure(maximum=max(total, 1), value=0)
+                self._app.start_prog("determinate")
+
+                if "id" not in headers:
+                    self._log("Missing required column: id")
+                    return
+
+                id_idx = headers.index("id")
+                sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
+                src_fields = self._selected_image_fields(headers)
+                upload_from_db = self._upload_mode.get() == "DB URL field(s)"
+                if upload_from_db and not src_fields:
+                    self._log("No valid image URL field(s) selected for DB URL upload mode.")
+                    return
+
+                for i, row in enumerate(data_rows, start=1):
+                    product_id = str(row[id_idx]).strip() if id_idx < len(row) and row[id_idx] not in (None, "") else ""
+                    if not product_id:
+                        skip_count += 1
+                        continue
+
+                    sku = ""
+                    if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, ""):
+                        sku = str(row[sku_idx]).strip()
+                    if not sku:
+                        sku = DEFAULT_SKU
+
+                    if upload_from_db:
+                        urls = self._row_image_urls(row, headers, src_fields)
+                        images = [{"src": u} for u in urls]
+                    else:
+                        images = self._image_payload_for_sku(sku)
+
+                    if not images:
+                        skip_count += 1
+                        if upload_from_db:
+                            self._log(f"Skip ID {product_id}: no URL found in selected DB image field(s)")
+                        else:
+                            self._log(f"Skip ID {product_id}: no image files for SKU '{sku}'")
+                    else:
+                        ok, code, err = update_product_api(
+                            store,
+                            token,
+                            product_id,
+                            {"product": {"id": product_id, "images": images}},
+                        )
+                        if ok:
+                            ok_count += 1
+                            if upload_from_db:
+                                self._log(f"OK ID {product_id}: uploaded {len(images)} image URLs from DB")
+                            else:
+                                self._log(f"OK ID {product_id}: uploaded {len(images)} images (SKU {sku})")
+                        else:
+                            fail_count += 1
+                            self._log(f"FAIL ID {product_id}: {code} {err}")
+
+                    self._prog["value"] = i
+                    self._stats.set(
+                        f"Row {i}/{total}  OK:{ok_count}  FAIL:{fail_count}  SKIP:{skip_count}"
+                    )
+                    time.sleep(0.35)
+
+                self._log(f"Done. OK:{ok_count} FAIL:{fail_count} SKIP:{skip_count}")
+                self._app.set_status("Images upload completed")
+                self._scan_folder_coverage()
+            except Exception as exc:
+                self._log(f"ERROR: {exc}")
+                self._app.set_status("Images upload failed")
+                messagebox.showerror("Images Upload Error", str(exc), parent=self)
+            finally:
+                self._running = False
+                self._app.stop_prog()
+
+        threading.Thread(target=task, daemon=True).start()

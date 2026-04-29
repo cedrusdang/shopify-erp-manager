@@ -28,6 +28,8 @@ upload_session.json
 backups/
 Shopify_database_264.xlsx
 shopify_database_*.xlsx
+store_profiles.json
+product_images/
 
 # IDE
 .vscode/
