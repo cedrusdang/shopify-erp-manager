@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 
 import openpyxl
 
-from ..api import update_product_api
+from ..api import fetch_first_variant_id, update_product_api
 from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR, REQUIRED_FIELDS
 from ..session import save_session, load_session, clear_session
 
@@ -40,12 +40,22 @@ class UploadTab(ttk.Frame):
     def _required_upload_fields(self) -> set[str]:
         """Fields that remain selected/locked in Upload selector.
 
-        Upload only needs product `id` (to identify the row) and
-        `variants.0.id` (so variant PUT knows which variant to update).
-        Deliberately does NOT include title/handle so that selecting only
-        variant columns results in exactly 1 variant request per SKU.
+        Keep only product `id` locked by default.
+        Other dependencies (e.g. `variants.0.id`) are auto-added at runtime
+        only when selected fields actually need them.
         """
-        return {"id", "variants.0.id"}
+        return {"id"}
+
+    def _dynamic_required_upload_fields(self, selected_cols: set[str]) -> set[str]:
+        """Infer runtime-required dependency fields from user selection."""
+        req = {"id"}
+        needs_variant_id = any(
+            h.startswith("variants.") and h != "variants.0.id"
+            for h in selected_cols
+        )
+        if needs_variant_id:
+            req.add("variants.0.id")
+        return req
 
     # ──────────────────────────────────────────────────
     def _build(self) -> None:
@@ -598,16 +608,35 @@ class UploadTab(ttk.Frame):
             )
             return
 
+        dyn_required = self._dynamic_required_upload_fields(selected_cols)
+        auto_added = sorted([f for f in dyn_required if f not in selected_cols])
+        selected_cols |= dyn_required
+        if auto_added:
+            self._log(
+                "Auto-added upload dependency field(s): " + ", ".join(auto_added)
+            )
+
         try:
             scan, blocked_rows = self._scan_upload_risks(file_path, selected_cols, start_row)
         except Exception as exc:
             messagebox.showerror("Pre-Scan Error", f"Cannot scan upload file:\n{exc}", parent=self)
             return
 
-        if scan["selected_missing_headers"]:
+        variant_fields_selected = any(
+            h.startswith("variants.") and h != "variants.0.id"
+            for h in selected_cols
+        )
+        missing_headers = list(scan["selected_missing_headers"])
+        if variant_fields_selected and "variants.0.id" in missing_headers:
+            missing_headers = [h for h in missing_headers if h != "variants.0.id"]
+            self._log(
+                "Pre-scan info: variants.0.id column missing in file; auto-fix will resolve first variant id from Shopify per product."
+            )
+
+        if missing_headers:
             self._log(
                 "Pre-scan warning: selected columns not found in file: "
-                + ", ".join(scan["selected_missing_headers"])
+                + ", ".join(missing_headers)
             )
         if scan["readonly_selected"]:
             self._log(
@@ -643,6 +672,8 @@ class UploadTab(ttk.Frame):
         msg += f"\n\nSelected upload columns: {len(selected_cols)}"
         msg += f"\nPre-scan risky rows: {len(blocked_rows)}"
         msg += f"\nSafe delay: {self._safe_delay_value():.2f}s"
+        if variant_fields_selected:
+            msg += "\nVariant ID auto-fix: enabled"
         msg += "\n\nContinue?"
         if not self._app.confirm_danger("Confirm Upload", msg):
             return
@@ -665,6 +696,7 @@ class UploadTab(ttk.Frame):
             wb = None
             sent_count = 0
             done_count = 0
+            variant_id_cache: dict[str, str] = {}
             throttle_until = 0.0
             throttle_events: list[tuple[float, str]] = []
             throttle_lock = threading.Lock()
@@ -709,6 +741,10 @@ class UploadTab(ttk.Frame):
                 headers   = [str(h or "").strip() for h in rows[0]]
                 data_rows = rows[1:]
                 total     = len(data_rows)
+                selected_has_variant_fields = any(
+                    h.startswith("variants.") and h != "variants.0.id"
+                    for h in selected_cols
+                )
 
                 if "id" not in headers:
                     self._log("ERROR: 'id' column not found.")
@@ -791,6 +827,21 @@ class UploadTab(ttk.Frame):
                                 mark_done(idx)
                                 continue
 
+                            resolved_variant_id = ""
+                            if selected_has_variant_fields:
+                                resolved_variant_id = rv("variants.0.id") or ""
+                                if not resolved_variant_id:
+                                    if product_id in variant_id_cache:
+                                        resolved_variant_id = variant_id_cache[product_id]
+                                    else:
+                                        fetched = fetch_first_variant_id(store, token, str(product_id)) or ""
+                                        variant_id_cache[product_id] = fetched
+                                        resolved_variant_id = fetched
+                                    if resolved_variant_id:
+                                        self._log(
+                                            f"Row {idx + 2}  ID {product_id}: auto-fixed variants.0.id -> {resolved_variant_id}"
+                                        )
+
                             prod: dict = {"id": str(product_id)}
                             for ci, h in enumerate(headers):
                                 if h not in selected_cols or h == "id":
@@ -800,6 +851,18 @@ class UploadTab(ttk.Frame):
                                 if ci >= len(row) or row[ci] in (None, ""):
                                     continue
                                 self._set_path_value(prod, h, str(row[ci]))
+
+                            if selected_has_variant_fields:
+                                if resolved_variant_id:
+                                    self._set_path_value(prod, "variants.0.id", str(resolved_variant_id))
+                                else:
+                                    fail_count += 1
+                                    self._log(
+                                        f"Row {idx + 2}  ID {product_id}: FAIL auto-fix (cannot resolve variants.0.id from Shopify)"
+                                    )
+                                    last_sku_secs = max(0.0, time.perf_counter() - row_started)
+                                    mark_done(idx)
+                                    continue
 
                             image_map: dict[int, dict] = {}
                             for ci, h in enumerate(headers):
@@ -855,7 +918,15 @@ class UploadTab(ttk.Frame):
                                 if images_payload:
                                     prod["images"] = images_payload
 
-                            if len(prod) == 1:
+                            _p_keys_check = {k for k in prod if k not in {"id", "variants", "images", "metafields"} and prod[k] not in (None, "")}
+                            _has_product_check = bool(_p_keys_check)
+                            _has_variant_check = isinstance(prod.get("variants"), list) and any(
+                                len({k: v for k, v in v.items() if k != "id" and v not in (None, "")}) > 0
+                                for v in prod.get("variants", []) if isinstance(v, dict) and v.get("id")
+                            )
+                            _has_images_check = isinstance(prod.get("images"), list) and bool(prod["images"])
+                            _has_meta_check = bool(prod.get("metafields"))
+                            if not (_has_product_check or _has_variant_check or _has_images_check or _has_meta_check):
                                 skip_count += 1
                                 self._log(
                                     f"Row {idx + 2}  ID {product_id}: skip (no selected fields with value)"

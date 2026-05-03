@@ -156,21 +156,13 @@ class DownloadTab(ttk.Frame):
             style="Primary.TButton",
         ).pack(fill=tk.X, pady=3)
 
-        self._download_images_opt_in = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
+        ttk.Label(
             right,
-            text="Download images (only when checked)",
-            variable=self._download_images_opt_in,
-        ).pack(anchor=tk.W, pady=(6, 0))
-        ttk.Label(right, text="Image URL field (single):", font=("Segoe UI", 8)).pack(anchor=tk.W, pady=(4, 0))
-        self._image_url_field = tk.StringVar(value="images.0.src")
-        self._image_url_field_combo = ttk.Combobox(
-            right,
-            textvariable=self._image_url_field,
-            state="normal",
-            width=28,
-        )
-        self._image_url_field_combo.pack(fill=tk.X, pady=(2, 4))
+            text="Image download moved to 'Image Download Upload' tab.",
+            foreground="#666",
+            wraplength=210,
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(6, 4))
 
         ttk.Button(
             right, text="📂  Open Current File",
@@ -218,6 +210,28 @@ class DownloadTab(ttk.Frame):
     def _save_field_state(self) -> None:
         save_field_state(self.fields.get_optional_fields(), self.fields.get_selected())
 
+    def _with_auto_required_fields(self, selected_fields: list[str]) -> tuple[list[str], list[str]]:
+        """Auto-append hidden dependency fields needed for reliable upload later.
+
+        Rules:
+        - Always keep `id`.
+        - If any selected field targets variant payload (variants.*), include `variants.0.id`.
+        """
+        fields = [f for f in selected_fields if str(f).strip()]
+        out = list(fields)
+        added: list[str] = []
+
+        if "id" not in out:
+            out.append("id")
+            added.append("id")
+
+        needs_variant_id = any(f.startswith("variants.") and f != "variants.0.id" for f in out)
+        if needs_variant_id and "variants.0.id" not in out:
+            out.append("variants.0.id")
+            added.append("variants.0.id")
+
+        return out, added
+
     # ──────────────────────────────────────────────────
     def current_xlsx(self) -> Path:
         return Path(DATABASE_FILE)
@@ -245,7 +259,7 @@ class DownloadTab(ttk.Frame):
             self._progress_tree.delete(*self._progress_tree.get_children())
             run = self._progress_tree.insert("", tk.END, text="Download", values=("RUNNING", f"Mode {mode}: {target_desc}"))
             fetch = self._progress_tree.insert(run, tk.END, text="Fetch Products", values=("PENDING", "Waiting"))
-            images = self._progress_tree.insert(run, tk.END, text="Download Images", values=("PENDING", "Waiting"))
+            images = self._progress_tree.insert(run, tk.END, text="Images (Image Tab)", values=("PENDING", "Waiting"))
             write = self._progress_tree.insert(run, tk.END, text="Write Excel", values=("PENDING", "Waiting"))
             refresh = self._progress_tree.insert(run, tk.END, text="Refresh Live DB", values=("PENDING", "Waiting"))
             backup = self._progress_tree.insert(run, tk.END, text="Create Backup", values=("PENDING", "Waiting"))
@@ -276,11 +290,8 @@ class DownloadTab(ttk.Frame):
         self.after(0, _ui)
 
     def _refresh_image_url_field_candidates(self) -> None:
-        selected = self.fields.get_selected()
-        candidates = [f for f in selected if f and f not in REQUIRED_FIELDS]
-        if self._image_url_field.get().strip() and self._image_url_field.get().strip() not in candidates:
-            candidates.insert(0, self._image_url_field.get().strip())
-        self._image_url_field_combo["values"] = candidates
+        # Image flow was moved out of Download tab; keep as no-op for compatibility.
+        return
 
     def _set_by_path(self, obj: object, path: str, value: object) -> bool:
         """Best-effort setter for dot path like variants.0.sku."""
@@ -380,7 +391,7 @@ class DownloadTab(ttk.Frame):
         discover_generation = self._discover_generation
 
         def task():
-            self._app.start_prog(use_busy_cursor=False)
+            self._app.start_prog(use_busy_cursor=True)
             self._log("Discovering metafield definitions…")
             try:
                 mf = fetch_metafield_definitions(store, token)
@@ -388,7 +399,7 @@ class DownloadTab(ttk.Frame):
             except Exception as exc:
                 self.after(0, lambda: self._on_discover_error(exc))
             finally:
-                self._app.stop_prog(clear_busy_cursor=False)
+                self._app.stop_prog(clear_busy_cursor=True)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -516,11 +527,12 @@ class DownloadTab(ttk.Frame):
         if not fields:
             messagebox.showwarning("No Fields", "Select at least one field.", parent=self)
             return
-        image_enabled = bool(self._download_images_opt_in.get())
-        image_field = self._image_url_field.get().strip()
-        if image_enabled and not image_field:
-            messagebox.showwarning("Image Field", "Please specify the image URL field to download images.", parent=self)
-            return
+        fields, auto_added_fields = self._with_auto_required_fields(fields)
+        if auto_added_fields:
+            self._log(
+                "Auto-added dependency field(s): " + ", ".join(auto_added_fields)
+                + " (for upload compatibility)"
+            )
 
         out = self.current_xlsx()
         mode = self._scope_mode.get()
@@ -620,18 +632,8 @@ class DownloadTab(ttk.Frame):
                     self._set_progress_step("fetch", "DONE", f"{total} products + metafields")
 
                 current_step = "images"
-                if image_enabled:
-                    self._set_progress_step("images", "RUNNING", f"Field: {image_field}")
-                    img_ok, img_fail = self._download_images_to_local(products, image_field)
-                    self._log(
-                        f"Images downloaded from '{image_field}' to '{IMAGE_DIR}': {img_ok} success, {img_fail} failed"
-                    )
-                    if img_fail > 0:
-                        logger.warning(f"Image download had {img_fail} failures")
-                    self._set_progress_step("images", "DONE", f"OK {img_ok} / Fail {img_fail}")
-                else:
-                    self._set_progress_step("images", "SKIPPED", "Disabled (opt-in)")
-                    self._log("Image download skipped (not enabled).")
+                self._set_progress_step("images", "SKIPPED", "Use Image Download Upload tab")
+                self._log("Image handling is managed in 'Image Download Upload' tab.")
 
                 self._app.start_prog("determinate", use_busy_cursor=False)
 

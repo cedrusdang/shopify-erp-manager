@@ -196,6 +196,37 @@ def test_connection(store: str, token: str) -> tuple[bool, str]:
         return False, "Shop response is not valid JSON."
 
 
+def fetch_first_variant_id(store: str, token: str, product_id: str) -> str | None:
+    """Return first variant id for a product, or None if unavailable."""
+    pid = _gid_tail(str(product_id or "").strip())
+    if not pid:
+        return None
+    try:
+        url = f"{_rest_base_url(store)}/products/{quote(pid)}.json"
+        resp = requests.get(
+            url,
+            headers=_headers(token),
+            params={"fields": "id,variants"},
+            timeout=30,
+        )
+        if not resp.ok:
+            return None
+        body = resp.json()
+        prod = body.get("product", {}) if isinstance(body, dict) else {}
+        variants = prod.get("variants", []) if isinstance(prod, dict) else []
+        if not isinstance(variants, list):
+            return None
+        for v in variants:
+            if not isinstance(v, dict):
+                continue
+            vid = str(v.get("id", "")).strip()
+            if vid:
+                return vid
+        return None
+    except Exception:
+        return None
+
+
 def fetch_all_products(
     store: str,
     token: str,

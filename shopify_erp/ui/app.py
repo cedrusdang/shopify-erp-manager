@@ -186,7 +186,7 @@ class ShopifyERPApp(tk.Tk):
 
         nb.add(self._tab_download, text="  ⬇  Download  ")
         nb.add(self._tab_upload,   text="  ⬆  Upload  ")
-        nb.add(self._tab_images,   text="  🖼  Images Upload  ")
+        nb.add(self._tab_images,   text="  🖼  Image Download Upload  ")
         nb.add(self._tab_mimic,    text="  🛍  Shopify Mimic  ")
         nb.add(self._tab_backup,   text="  💾  Backup  ")
         nb.add(self._tab_live_full, text="  🗄  Live DB (Full)  ")
