@@ -21,10 +21,13 @@ ENV/
 
 # dotenv — NEVER commit real credentials
 .env
+.env.*
+!.env.example
 
 # App runtime files
 credentials.txt
 upload_session.json
+download_field_state.json
 backups/
 Shopify_database_264.xlsx
 shopify_database_*.xlsx

@@ -19,9 +19,10 @@ import openpyxl
 import requests
 from openpyxl.styles import Font
 
-from ..api import fetch_all_products, fetch_metafield_definitions, fetch_products_page, fetch_products_range, get_by_path
+from ..api import fetch_all_products, fetch_metafield_definitions, fetch_products_page, fetch_products_range, get_by_path, enrich_products_with_metafields
 from ..backup import create_backup, open_file
-from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR, REQUIRED_FIELDS, OPTIONAL_FIELDS
+from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR, REQUIRED_FIELDS
+from ..download_field_state import load_field_state, save_field_state
 from ..field_presets import delete_preset, load_presets, upsert_preset
 from ..ui.widgets import FieldSelector
 
@@ -33,12 +34,17 @@ class DownloadTab(ttk.Frame):
         super().__init__(parent)
         self._app = app
         self._running = False
+        self._discover_generation = 0
         self._presets: list[dict] = []
         self._progress_nodes: dict[str, str] = {}
         self._build()
 
     # ──────────────────────────────────────────────────
     def _build(self) -> None:
+        saved_state = load_field_state()
+        saved_optional = [str(f) for f in saved_state.get("optional_fields", []) if str(f).strip()]
+        saved_selected = [str(f) for f in saved_state.get("selected_fields", []) if str(f).strip()]
+
         # Left: field selector
         left = ttk.Frame(self)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -48,8 +54,11 @@ class DownloadTab(ttk.Frame):
             font=("Segoe UI", 10, "bold"),
             foreground="#0f6b45",
         ).pack(anchor=tk.W, pady=(0, 6))
-        self.fields = FieldSelector(left, REQUIRED_FIELDS, OPTIONAL_FIELDS)
+        # Query-first mode: optional fields are discovered dynamically.
+        self.fields = FieldSelector(left, REQUIRED_FIELDS, saved_optional, on_change=self._save_field_state)
         self.fields.pack(fill=tk.BOTH, expand=True)
+        if saved_selected:
+            self.fields.set_selected(saved_selected)
 
         preset = ttk.LabelFrame(left, text=" Selection Presets ", padding=8)
         preset.pack(fill=tk.X, pady=(6, 4))
@@ -86,6 +95,11 @@ class DownloadTab(ttk.Frame):
             text="(3a) Discover More Fields",
             command=self._discover_fields,
         ).pack(fill=tk.X, pady=4)
+        ttk.Button(
+            left,
+            text="Reset Extra Fields",
+            command=self._reset_discovered_fields,
+        ).pack(fill=tk.X, pady=(0, 4))
 
         self._refresh_presets()
 
@@ -201,6 +215,9 @@ class DownloadTab(ttk.Frame):
         self._refresh_image_url_field_candidates()
         self._on_scope_changed()
 
+    def _save_field_state(self) -> None:
+        save_field_state(self.fields.get_optional_fields(), self.fields.get_selected())
+
     # ──────────────────────────────────────────────────
     def current_xlsx(self) -> Path:
         return Path(DATABASE_FILE)
@@ -211,6 +228,17 @@ class DownloadTab(ttk.Frame):
     def _safe_sku(self, value: str) -> str:
         sku = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
         return (sku[:80] or "product")
+
+    def _field_suffix(self, field_name: str) -> str:
+        m = re.match(r"^images\.(\d+)\.src$", field_name)
+        if m:
+            return f"img_{m.group(1)}"
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", (field_name or "").strip())
+        return clean[:40] or "img"
+
+    def _field_folder_name(self, field_name: str) -> str:
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", (field_name or "").strip())
+        return clean[:80] or "images"
 
     def _reset_progress_tree(self, mode: str, target_desc: str) -> None:
         def _ui() -> None:
@@ -305,6 +333,9 @@ class DownloadTab(ttk.Frame):
         ok = 0
         fail = 0
         valid_ext = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+        field_suffix = self._field_suffix(image_field)
+        field_folder = image_dir / self._field_folder_name(image_field)
+        field_folder.mkdir(parents=True, exist_ok=True)
 
         for p in products:
             raw = get_by_path(p, image_field)
@@ -323,8 +354,8 @@ class DownloadTab(ttk.Frame):
                     ext = Path(urlparse(src).path).suffix.lower()
                     if ext not in valid_ext:
                         ext = ".jpg"
-                    file_name = f"{safe_sku}{'' if i == 0 else f'_{i + 1}'}{ext}"
-                    target = image_dir / file_name
+                    file_name = f"{safe_sku}_{field_suffix}{ext}"
+                    target = field_folder / file_name
 
                     r = requests.get(src, timeout=30)
                     r.raise_for_status()
@@ -345,23 +376,49 @@ class DownloadTab(ttk.Frame):
         if not store:
             return
 
+        self._discover_generation += 1
+        discover_generation = self._discover_generation
+
         def task():
-            self._app.start_prog()
+            self._app.start_prog(use_busy_cursor=False)
             self._log("Discovering metafield definitions…")
             try:
-                mf    = fetch_metafield_definitions(store, token)
-                added = self.fields.add_optional_fields(mf)
-                self._log(
-                    f"Found {len(mf)} definitions. {added} new fields added."
-                )
-                self._app.set_status(f"Discovered {len(mf)} metafield definitions")
+                mf = fetch_metafield_definitions(store, token)
+                self.after(0, lambda: self._apply_discovered_fields(mf, discover_generation))
             except Exception as exc:
-                self._log(f"Error: {exc}")
-                messagebox.showerror("Error", str(exc), parent=self)
+                self.after(0, lambda: self._on_discover_error(exc))
             finally:
-                self._app.stop_prog()
+                self._app.stop_prog(clear_busy_cursor=False)
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _apply_discovered_fields(self, mf: list[str], discover_generation: int) -> None:
+        if discover_generation != self._discover_generation:
+            self._log("Skipped stale discover result (field list changed meanwhile).")
+            return
+        added = self.fields.add_optional_fields(mf)
+        self._save_field_state()
+        self._refresh_image_url_field_candidates()
+        mf_fields = [f for f in mf if ".metafields." in f]
+        self._log(f"Found {len(mf)} definitions. {added} new fields added.")
+        if mf_fields:
+            self._log(f"  Metafields discovered: {', '.join(mf_fields)}")
+        else:
+            self._log("  WARNING: No metafield paths found in discover result.")
+        self._app.set_status(f"Discovered {len(mf)} metafield definitions")
+
+    def _on_discover_error(self, exc: Exception) -> None:
+        self._log(f"Error: {exc}")
+        messagebox.showerror("Error", str(exc), parent=self)
+
+    def _reset_discovered_fields(self) -> None:
+        # Invalidate any in-flight discover task so stale result cannot re-add fields.
+        self._discover_generation += 1
+        removed = self.fields.reset_optional_fields()
+        self._save_field_state()
+        self._refresh_image_url_field_candidates()
+        self._log(f"Reset fields: removed {removed} discovered extra field(s).")
+        self._app.set_status("Field list reset to default optional fields")
 
     def _on_scope_changed(self) -> None:
         single = self._scope_mode.get() == "Single Page"
@@ -428,6 +485,7 @@ class DownloadTab(ttk.Frame):
         # If preset contains fields discovered previously, re-add them before applying.
         self.fields.add_optional_fields(fields)
         self.fields.set_selected(fields)
+        self._save_field_state()
         self._refresh_image_url_field_candidates()
         self._log(f"Preset loaded: {row.get('name', '')} ({len(fields)} fields)")
 
@@ -493,7 +551,7 @@ class DownloadTab(ttk.Frame):
 
         def task():
             current_step = "fetch"
-            self._app.start_prog("indeterminate")
+            self._app.start_prog("indeterminate", use_busy_cursor=False)
             self._reset_progress_tree(mode, target_desc)
             self._log("Starting download…")
             logger.info(f"Download started - Mode: {mode}, Store: {store}")
@@ -550,6 +608,17 @@ class DownloadTab(ttk.Frame):
 
                 self._set_progress_step("fetch", "DONE", f"{total} products")
 
+                # Enrich with metafields if any selected field requires them
+                needs_mf = any(".metafields." in f for f in fields)
+                if needs_mf and products:
+                    self._log(f"Fetching metafields for {total} products…")
+                    self._set_progress_step("fetch", "RUNNING", "Fetching metafields")
+                    enrich_products_with_metafields(
+                        products, store, token, fields,
+                        on_progress=lambda m: (self._log(m), self._app.set_status(m)),
+                    )
+                    self._set_progress_step("fetch", "DONE", f"{total} products + metafields")
+
                 current_step = "images"
                 if image_enabled:
                     self._set_progress_step("images", "RUNNING", f"Field: {image_field}")
@@ -564,7 +633,7 @@ class DownloadTab(ttk.Frame):
                     self._set_progress_step("images", "SKIPPED", "Disabled (opt-in)")
                     self._log("Image download skipped (not enabled).")
 
-                self._app.start_prog("determinate")
+                self._app.start_prog("determinate", use_busy_cursor=False)
 
                 logger.debug(f"Creating Excel workbook with {len(fields)} fields")
                 current_step = "write"
@@ -589,6 +658,7 @@ class DownloadTab(ttk.Frame):
                     self._set_progress_step("write", "RUNNING", f"Rows {start + 2}-{min(start + BATCH + 1, total + 1)}")
 
                 wb.save(out)
+                wb.close()
                 logger.info(f"Excel file saved successfully: {out}")
                 self._log(f"Saved: {out.resolve()}")
 
@@ -634,7 +704,7 @@ class DownloadTab(ttk.Frame):
                 messagebox.showerror("Download Error", str(exc), parent=self)
             finally:
                 self._running = False
-                self._app.stop_prog()
+                self._app.stop_prog(clear_busy_cursor=False)
 
         threading.Thread(target=task, daemon=True).start()
 

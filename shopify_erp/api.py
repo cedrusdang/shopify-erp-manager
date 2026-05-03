@@ -14,6 +14,10 @@ from .constants import API_VER
 
 logger = logging.getLogger(__name__)
 
+# Fast-path cache for metafield uploads:
+# verify once (first owner/first SKU), then reuse known type/strategy for next rows.
+_METAFIELD_VERIFY_CACHE: dict[tuple[str, str, str], dict[str, str]] = {}
+
 
 # ──────────────────────────────────────────────────────────
 #  Shared headers
@@ -319,35 +323,366 @@ def fetch_products_range(
     return out, (actual_start or last_page), (actual_end or last_page), False
 
 
-def fetch_metafield_definitions(store: str, token: str) -> list[str]:
-    """Return flat dot-notation paths for all metafield definitions via REST."""
-    results: list[str] = []
-    for owner, prefix in [("product", "metafields"), ("variant", "variants.0.metafields")]:
-        url = f"{_rest_base_url(store)}/metafield_definitions.json"
-        params = {"owner_resource": owner, "limit": 250}
-        try:
-            resp = requests.get(
-                url,
-                headers=_headers(token),
-                params=params,
-                timeout=30,
-            )
-            if not resp.ok:
-                # REST metafield definitions endpoint can be unavailable on some API versions.
-                logger.info(f"Metafield definitions via REST unavailable for {owner}: HTTP {resp.status_code}")
-                continue
+def _collect_metafield_keys_via_index_endpoint(
+    store: str,
+    token: str,
+    owner: str,
+    prefix: str,
+    max_pages: int = 40,
+) -> set[str]:
+    """Collect metafield keys from /metafields.json index endpoint with cursor pagination."""
+    results: set[str] = set()
+    page_info: str | None = None
+    seen_page_info: set[str] = set()
+    page = 1
 
-            body = resp.json()
-            defs = body.get("metafield_definitions", []) if isinstance(body, dict) else []
-            for n in defs:
-                ns = n.get("namespace", "")
-                key = n.get("key", "")
-                if ns and key:
-                    results.append(f"{prefix}.{ns}.{key}")
-        except Exception as exc:
-            logger.info(f"Metafield definitions via REST exception for {owner}: {exc}")
+    while page <= max_pages:
+        url = f"{_rest_base_url(store)}/metafields.json"
+        if page_info:
+            params = {"limit": 250, "page_info": page_info}
+        else:
+            params = {"limit": 250, "metafield[owner_resource]": owner}
+
+        resp = requests.get(url, headers=_headers(token), params=params, timeout=30)
+        if not resp.ok:
+            break
+
+        body = resp.json()
+        items = body.get("metafields", []) if isinstance(body, dict) else []
+        if not items:
+            break
+
+        for mf in items:
+            if not isinstance(mf, dict):
+                continue
+            ns = str(mf.get("namespace", "")).strip()
+            key = str(mf.get("key", "")).strip()
+            owner_res = str(mf.get("owner_resource", "")).strip().lower()
+            if ns and key and (not owner_res or owner_res == owner):
+                results.add(f"{prefix}.{ns}.{key}")
+
+        next_page_info = _parse_next_page_info(resp.headers.get("Link", ""))
+        if not next_page_info:
+            break
+        if next_page_info in seen_page_info:
+            logger.warning("Metafield index pagination loop detected; stopping discovery.")
+            break
+
+        seen_page_info.add(next_page_info)
+        page_info = next_page_info
+        page += 1
 
     return results
+
+
+def _collect_metafields_for_resource(
+    url: str,
+    token: str,
+) -> list[dict]:
+    """Fetch all metafields for a specific product/variant resource with cursor pagination."""
+    out: list[dict] = []
+    page_info: str | None = None
+    seen_page_info: set[str] = set()
+    while True:
+        if page_info:
+            params = {"limit": 250, "page_info": page_info}
+        else:
+            params = {"limit": 250}
+        resp = requests.get(url, headers=_headers(token), params=params, timeout=30)
+        if not resp.ok:
+            break
+        body = resp.json()
+        items = body.get("metafields", []) if isinstance(body, dict) else []
+        if not items:
+            break
+        out.extend(items)
+        next_page_info = _parse_next_page_info(resp.headers.get("Link", ""))
+        if not next_page_info:
+            break
+        if next_page_info in seen_page_info:
+            logger.warning("Resource metafields pagination loop detected; stopping resource scan.")
+            break
+        seen_page_info.add(next_page_info)
+        page_info = next_page_info
+    return out
+
+
+def _collect_metafield_keys_via_resource_scan(
+    store: str,
+    token: str,
+) -> set[str]:
+    """Fallback: full scan product/variant resources and collect metafield namespace.key paths."""
+    results: set[str] = set()
+    page_info: str | None = None
+    seen_page_info: set[str] = set()
+    page = 1
+    max_pages = 2000
+
+    while page <= max_pages:
+        items, next_page_info = _rest_get_products_page(store, token, page_info=page_info, limit=250)
+        if not items:
+            break
+
+        for p in items:
+            pid = str(p.get("id", "")).strip()
+            if not pid:
+                continue
+
+            # Product metafields
+            try:
+                prod_url = f"{_rest_base_url(store)}/products/{quote(pid)}/metafields.json"
+                for mf in _collect_metafields_for_resource(prod_url, token):
+                    if not isinstance(mf, dict):
+                        continue
+                    ns = str(mf.get("namespace", "")).strip()
+                    key = str(mf.get("key", "")).strip()
+                    if ns and key:
+                        results.add(f"metafields.{ns}.{key}")
+            except Exception:
+                pass
+
+            # Variant metafields
+            variants = p.get("variants", []) or []
+            if isinstance(variants, list):
+                for v in variants:
+                    vid = str((v or {}).get("id", "")).strip() if isinstance(v, dict) else ""
+                    if not vid:
+                        continue
+                    try:
+                        var_url = f"{_rest_base_url(store)}/variants/{quote(vid)}/metafields.json"
+                        for mf in _collect_metafields_for_resource(var_url, token):
+                            if not isinstance(mf, dict):
+                                continue
+                            ns = str(mf.get("namespace", "")).strip()
+                            key = str(mf.get("key", "")).strip()
+                            if ns and key:
+                                results.add(f"variants.0.metafields.{ns}.{key}")
+                    except Exception:
+                        pass
+
+        if not next_page_info:
+            break
+        if next_page_info in seen_page_info:
+            logger.warning("Product sampling pagination loop detected; stopping metafield discovery.")
+            break
+        seen_page_info.add(next_page_info)
+        page_info = next_page_info
+        page += 1
+
+    return results
+
+
+def fetch_metafield_definitions(store: str, token: str) -> list[str]:
+    """Fast discovery: infer fields from product #1 on page 1, plus its own metafields."""
+
+    def _flatten_paths(obj: object, base: str = "") -> set[str]:
+        out: set[str] = set()
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = f"{base}.{k}" if base else str(k)
+                out.add(key)
+                out.update(_flatten_paths(v, key))
+        elif isinstance(obj, list) and obj:
+            idx_key = f"{base}.0" if base else "0"
+            out.add(idx_key)
+            out.update(_flatten_paths(obj[0], idx_key))
+        return out
+
+    results: set[str] = set()
+    # Fetch first 10 products to get a representative sample of standard field paths
+    items, _ = _rest_get_products_page(store, token, page_info=None, limit=10)
+    if not items:
+        return []
+
+    p = items[0]
+    internal = _rest_product_to_internal(p)
+    results.update(_flatten_paths(internal))
+
+    base = _rest_base_url(store)
+    hdrs = _headers(token)
+
+    for p in items:
+        pid = str(p.get("id", "")).strip()
+        if pid:
+            try:
+                r_prod = requests.get(
+                    f"{base}/products/{quote(pid)}/metafields.json",
+                    headers=hdrs,
+                    params={"limit": 250},
+                    timeout=30,
+                )
+                if r_prod.ok:
+                    body = r_prod.json()
+                    for mf in body.get("metafields", []) if isinstance(body, dict) else []:
+                        if not isinstance(mf, dict):
+                            continue
+                        ns = str(mf.get("namespace", "")).strip()
+                        key = str(mf.get("key", "")).strip()
+                        if ns and key:
+                            results.add(f"metafields.{ns}.{key}")
+            except Exception:
+                pass
+
+        variants = p.get("variants", []) or []
+        if isinstance(variants, list) and variants:
+            v0 = variants[0] if isinstance(variants[0], dict) else {}
+            vid = str(v0.get("id", "")).strip()
+            if vid:
+                try:
+                    r_var = requests.get(
+                        f"{base}/variants/{quote(vid)}/metafields.json",
+                        headers=hdrs,
+                        params={"limit": 250},
+                        timeout=30,
+                    )
+                    if r_var.ok:
+                        body = r_var.json()
+                        for mf in body.get("metafields", []) if isinstance(body, dict) else []:
+                            if not isinstance(mf, dict):
+                                continue
+                            ns = str(mf.get("namespace", "")).strip()
+                            key = str(mf.get("key", "")).strip()
+                            if ns and key:
+                                results.add(f"variants.0.metafields.{ns}.{key}")
+                except Exception:
+                    pass
+
+    # Use GraphQL metafield definitions to discover ALL defined fields regardless of value
+    try:
+        gql_url = f"https://{store}/admin/api/{API_VER}/graphql.json"
+        for owner_type, prefix in [("PRODUCT", "metafields"), ("PRODUCTVARIANT", "variants.0.metafields")]:
+            cursor: str | None = None
+            while True:
+                after = f', after: "{cursor}"' if cursor else ""
+                query = f"""
+                {{
+                  metafieldDefinitions(ownerType: {owner_type}, first: 250{after}) {{
+                    edges {{
+                      node {{ namespace key }}
+                      cursor
+                    }}
+                    pageInfo {{ hasNextPage }}
+                  }}
+                }}
+                """
+                resp = requests.post(gql_url, headers=hdrs, json={"query": query}, timeout=30)
+                if not resp.ok:
+                    break
+                data = resp.json().get("data", {}) or {}
+                conn = data.get("metafieldDefinitions", {}) or {}
+                edges = conn.get("edges", []) or []
+                for edge in edges:
+                    node = edge.get("node", {}) or {}
+                    ns = str(node.get("namespace", "")).strip()
+                    key = str(node.get("key", "")).strip()
+                    if ns and key:
+                        results.add(f"{prefix}.{ns}.{key}")
+                    cursor = edge.get("cursor")
+                if not conn.get("pageInfo", {}).get("hasNextPage"):
+                    break
+    except Exception:
+        pass
+
+    # Also scan store-wide metafield index to catch fields not on the first product
+    try:
+        results.update(_collect_metafield_keys_via_index_endpoint(store, token, "product", "metafields"))
+    except Exception:
+        pass
+    try:
+        results.update(
+            f"variants.0.{k}"
+            for k in _collect_metafield_keys_via_index_endpoint(store, token, "variant", "metafields")
+        )
+    except Exception:
+        pass
+
+    return sorted(results)
+
+
+def enrich_products_with_metafields(
+    products: list[dict],
+    store: str,
+    token: str,
+    fields: list[str],
+    on_progress: Callable[[str], None] | None = None,
+) -> None:
+    """Attach metafield values into each product dict in-place.
+
+    For every product, fetch product-level and variant-level metafields
+    that match the namespace.key pairs found in *fields*.
+
+    After this call:
+      p["metafields"]["namespace"]["key"] = value          (product metafield)
+      p["variants"][i]["metafields"]["namespace"]["key"]   (variant metafield)
+    """
+    need_product_mf = any(
+        f.startswith("metafields.") and not f.startswith("variants.") for f in fields
+    )
+    need_variant_mf = any(f.startswith("variants.") and ".metafields." in f for f in fields)
+
+    if not need_product_mf and not need_variant_mf:
+        return
+
+    base = _rest_base_url(store)
+    hdrs = _headers(token)
+    total = len(products)
+
+    for idx, p in enumerate(products):
+        pid = str(p.get("id", "")).strip()
+        if on_progress and idx % 10 == 0:
+            on_progress(f"Fetching metafields {idx + 1}/{total}…")
+
+        if need_product_mf and pid:
+            try:
+                resp = requests.get(
+                    f"{base}/products/{quote(pid)}/metafields.json",
+                    headers=hdrs,
+                    params={"limit": 250},
+                    timeout=30,
+                )
+                if resp.ok:
+                    mf_dict: dict = p.setdefault("metafields", {})
+                    for mf in resp.json().get("metafields", []):
+                        if not isinstance(mf, dict):
+                            continue
+                        ns = str(mf.get("namespace", "")).strip()
+                        key = str(mf.get("key", "")).strip()
+                        val = mf.get("value", "")
+                        if ns and key:
+                            mf_dict.setdefault(ns, {})[key] = val
+            except Exception:
+                pass
+
+        if need_variant_mf:
+            variants = p.get("variants") or []
+            for v in variants:
+                if not isinstance(v, dict):
+                    continue
+                vid = str(v.get("id", "")).strip()
+                if not vid:
+                    continue
+                try:
+                    resp = requests.get(
+                        f"{base}/variants/{quote(vid)}/metafields.json",
+                        headers=hdrs,
+                        params={"limit": 250},
+                        timeout=30,
+                    )
+                    if resp.ok:
+                        vmf_dict: dict = v.setdefault("metafields", {})
+                        for mf in resp.json().get("metafields", []):
+                            if not isinstance(mf, dict):
+                                continue
+                            ns = str(mf.get("namespace", "")).strip()
+                            key = str(mf.get("key", "")).strip()
+                            val = mf.get("value", "")
+                            if ns and key:
+                                vmf_dict.setdefault(ns, {})[key] = val
+                except Exception:
+                    pass
+
+    if on_progress:
+        on_progress(f"Metafields fetched for {total} products.")
 
 
 # ──────────────────────────────────────────────────────────
@@ -359,23 +694,161 @@ def update_product_api(
     product_id: str,
     payload: dict,
     max_retries: int = 5,
+    stats: dict | None = None,
+    on_backoff: Callable[[float, str], None] | None = None,
 ) -> tuple[bool, int, str]:
     """REST product update. Returns (ok, status_code_like, error_message)."""
+
+    def _count_request() -> None:
+        if stats is None:
+            return
+        stats["requests"] = int(stats.get("requests", 0)) + 1
+
+    def _infer_metafield_type(value: object) -> str:
+        if isinstance(value, bool):
+            return "boolean"
+        s = str(value).strip()
+        if re.fullmatch(r"-?\d+", s):
+            return "number_integer"
+        if re.fullmatch(r"-?\d+\.\d+", s):
+            return "number_decimal"
+        return "single_line_text_field"
+
+    def _extract_metafield_items(mf_obj: object) -> list[tuple[str, str, object]]:
+        out: list[tuple[str, str, object]] = []
+        if not isinstance(mf_obj, dict):
+            return out
+        for ns, kv in mf_obj.items():
+            ns_s = str(ns).strip()
+            if not ns_s or not isinstance(kv, dict):
+                continue
+            for key, value in kv.items():
+                key_s = str(key).strip()
+                if not key_s or value in (None, ""):
+                    continue
+                out.append((ns_s, key_s, value))
+        return out
+
+    def _retry_after_seconds(resp: requests.Response) -> float | None:
+        raw = str(resp.headers.get("Retry-After", "")).strip()
+        if not raw:
+            return None
+        try:
+            v = float(raw)
+            return v if v >= 0 else None
+        except Exception:
+            return None
+
+    def _sleep_with_backoff(seconds: float, reason: str) -> None:
+        wait_secs = max(0.0, float(seconds or 0.0))
+        if on_backoff is not None:
+            try:
+                on_backoff(wait_secs, reason)
+            except Exception:
+                pass
+        time.sleep(wait_secs)
+
+    def _upsert_owner_metafield(owner_url: str, token_val: str, ns: str, key: str, value: object) -> tuple[bool, int, str]:
+        owner_resource = "variant" if "/variants/" in owner_url else "product"
+        cache_key = (owner_resource, ns, key)
+        cached = _METAFIELD_VERIFY_CACHE.get(cache_key)
+        inferred_type = _infer_metafield_type(value)
+
+        # Fast path after first verification: try POST directly.
+        if cached:
+            post_type = cached.get("type") or inferred_type
+            _count_request()
+            resp_post_fast = requests.post(
+                owner_url,
+                headers=_headers(token_val),
+                json={
+                    "metafield": {
+                        "namespace": ns,
+                        "key": key,
+                        "value": str(value),
+                        "type": post_type,
+                    }
+                },
+                timeout=30,
+            )
+            if resp_post_fast.ok:
+                return True, 200, ""
+            # If key already exists, fallback to lookup+update for this owner.
+            if resp_post_fast.status_code not in {409, 422}:
+                return False, resp_post_fast.status_code, f"HTTP {resp_post_fast.status_code}: {resp_post_fast.text[:300]}"
+
+        # Try to fetch existing metafield first, so we can preserve type.
+        _count_request()
+        resp_get = requests.get(
+            owner_url,
+            headers=_headers(token_val),
+            params={"namespace": ns, "key": key, "limit": 1},
+            timeout=30,
+        )
+        if not resp_get.ok:
+            return False, resp_get.status_code, f"HTTP {resp_get.status_code}: {resp_get.text[:300]}"
+
+        body = resp_get.json()
+        items = body.get("metafields", []) if isinstance(body, dict) else []
+        if items:
+            mf = items[0] if isinstance(items[0], dict) else {}
+            mf_id = str(mf.get("id", "")).strip()
+            mf_type = str(mf.get("type", "")).strip() or _infer_metafield_type(value)
+            if not mf_id:
+                return False, 0, "Invalid metafield id from Shopify"
+
+            url_put = f"{_rest_base_url(store)}/metafields/{quote(mf_id)}.json"
+            _count_request()
+            resp_put = requests.put(
+                url_put,
+                headers=_headers(token_val),
+                json={"metafield": {"id": mf_id, "value": str(value), "type": mf_type}},
+                timeout=30,
+            )
+            if not resp_put.ok:
+                return False, resp_put.status_code, f"HTTP {resp_put.status_code}: {resp_put.text[:300]}"
+            _METAFIELD_VERIFY_CACHE[cache_key] = {"type": mf_type}
+            return True, 200, ""
+
+        # Create new metafield if not found.
+        _count_request()
+        resp_post = requests.post(
+            owner_url,
+            headers=_headers(token_val),
+            json={
+                "metafield": {
+                    "namespace": ns,
+                    "key": key,
+                    "value": str(value),
+                    "type": inferred_type,
+                }
+            },
+            timeout=30,
+        )
+        if not resp_post.ok:
+            return False, resp_post.status_code, f"HTTP {resp_post.status_code}: {resp_post.text[:300]}"
+        _METAFIELD_VERIFY_CACHE[cache_key] = {"type": inferred_type}
+        return True, 200, ""
+
     wait = 1
     for attempt in range(max_retries):
         try:
             prod = payload.get("product", {}) if isinstance(payload, dict) else {}
             pid = _gid_tail(str(product_id))
 
-            # 1) top-level product update
+            # 1) top-level product update (pass through selected fields as-is)
             product_input: dict = {"id": pid}
-            top_fields = ["title", "body_html", "vendor", "product_type", "handle", "tags", "status"]
-            for key in top_fields:
-                if key in prod and prod[key] not in (None, ""):
-                    product_input[key] = str(prod[key])
+            if isinstance(prod, dict):
+                for key, value in prod.items():
+                    if key in {"id", "variants", "images", "metafields"}:
+                        continue
+                    if value in (None, ""):
+                        continue
+                    product_input[key] = value
 
             if len(product_input) > 1:
                 url_product = f"{_rest_base_url(store)}/products/{quote(str(pid))}.json"
+                _count_request()
                 resp_prod = requests.put(
                     url_product,
                     headers=_headers(token),
@@ -385,7 +858,9 @@ def update_product_api(
                 if not resp_prod.ok:
                     msg = f"HTTP {resp_prod.status_code}: {resp_prod.text[:300]}"
                     if resp_prod.status_code == 429 or "throttle" in msg.lower():
-                        time.sleep(wait)
+                        retry_after = _retry_after_seconds(resp_prod)
+                        sleep_for = retry_after if retry_after is not None else wait
+                        _sleep_with_backoff(sleep_for, "product throttled")
                         wait = min(wait * 2, 32)
                         continue
                     return False, resp_prod.status_code, msg
@@ -400,19 +875,16 @@ def update_product_api(
                     if not vid:
                         continue
                     one: dict = {"id": vid}
-                    if v.get("sku") not in (None, ""):
-                        one["sku"] = str(v.get("sku"))
-                    if v.get("price") not in (None, ""):
-                        one["price"] = str(v.get("price"))
-                    if v.get("compare_at_price") not in (None, ""):
-                        one["compare_at_price"] = str(v.get("compare_at_price"))
-                    if v.get("barcode") not in (None, ""):
-                        one["barcode"] = str(v.get("barcode"))
-                    if v.get("taxable") not in (None, ""):
-                        one["taxable"] = bool(v.get("taxable"))
+                    for key, value in v.items():
+                        if key in {"id", "metafields"}:
+                            continue
+                        if value in (None, ""):
+                            continue
+                        one[key] = value
                     if len(one) <= 1:
                         continue
                     url_var = f"{_rest_base_url(store)}/variants/{quote(str(vid))}.json"
+                    _count_request()
                     resp_var = requests.put(
                         url_var,
                         headers=_headers(token),
@@ -422,10 +894,34 @@ def update_product_api(
                     if not resp_var.ok:
                         msg = f"HTTP {resp_var.status_code}: {resp_var.text[:300]}"
                         if resp_var.status_code == 429 or "throttle" in msg.lower():
-                            time.sleep(wait)
+                            retry_after = _retry_after_seconds(resp_var)
+                            sleep_for = retry_after if retry_after is not None else wait
+                            _sleep_with_backoff(sleep_for, "variant throttled")
                             wait = min(wait * 2, 32)
                             continue
                         return False, resp_var.status_code, msg
+
+                    # 2b) variant metafields upsert
+                    for ns, key, value in _extract_metafield_items(v.get("metafields")):
+                        var_meta_url = f"{_rest_base_url(store)}/variants/{quote(str(vid))}/metafields.json"
+                        ok_mf, code_mf, msg_mf = _upsert_owner_metafield(var_meta_url, token, ns, key, value)
+                        if not ok_mf:
+                            if code_mf == 429 or "throttle" in msg_mf.lower():
+                                _sleep_with_backoff(wait, "variant metafield throttled")
+                                wait = min(wait * 2, 32)
+                                continue
+                            return False, code_mf, msg_mf
+
+            # 2c) product metafields upsert
+            for ns, key, value in _extract_metafield_items(prod.get("metafields") if isinstance(prod, dict) else None):
+                prod_meta_url = f"{_rest_base_url(store)}/products/{quote(str(pid))}/metafields.json"
+                ok_mf, code_mf, msg_mf = _upsert_owner_metafield(prod_meta_url, token, ns, key, value)
+                if not ok_mf:
+                    if code_mf == 429 or "throttle" in msg_mf.lower():
+                        _sleep_with_backoff(wait, "product metafield throttled")
+                        wait = min(wait * 2, 32)
+                        continue
+                    return False, code_mf, msg_mf
 
             # 3) images add via /products/{id}/images.json
             images = prod.get("images") if isinstance(prod, dict) else None
@@ -447,6 +943,7 @@ def update_product_api(
                         image_payload["alt"] = alt
 
                     url_img = f"{_rest_base_url(store)}/products/{quote(str(pid))}/images.json"
+                    _count_request()
                     resp_img = requests.post(
                         url_img,
                         headers=_headers(token),
@@ -456,19 +953,21 @@ def update_product_api(
                     if not resp_img.ok:
                         msg = f"HTTP {resp_img.status_code}: {resp_img.text[:300]}"
                         if resp_img.status_code == 429 or "throttle" in msg.lower():
-                            time.sleep(wait)
+                            retry_after = _retry_after_seconds(resp_img)
+                            sleep_for = retry_after if retry_after is not None else wait
+                            _sleep_with_backoff(sleep_for, "image throttled")
                             wait = min(wait * 2, 32)
                             continue
                         return False, resp_img.status_code, msg
 
             return True, 200, ""
         except requests.RequestException as exc:
-            time.sleep(wait)
+            _sleep_with_backoff(wait, f"network error: {exc}")
             wait = min(wait * 2, 32)
         except Exception as exc:
             msg = str(exc)
             if "429" in msg or "throttle" in msg.lower():
-                time.sleep(wait)
+                _sleep_with_backoff(wait, "generic throttled error")
                 wait = min(wait * 2, 32)
                 continue
             return False, 0, msg[:500]

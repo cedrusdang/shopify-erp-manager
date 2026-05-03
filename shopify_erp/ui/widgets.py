@@ -4,6 +4,7 @@ Scrollable checkbox field selector widget.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import tkinter as tk
 from tkinter import ttk
 
@@ -13,13 +14,22 @@ from ..constants import REQUIRED_FIELDS
 class FieldSelector(ttk.Frame):
     """Scrollable two-section checkbox list (required + optional)."""
 
-    def __init__(self, parent: tk.Widget, required: list[str], optional: list[str]):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        required: list[str],
+        optional: list[str],
+        on_change: Callable[[], None] | None = None,
+    ):
         super().__init__(parent)
         self._req  = list(required)
+        self._opt_base = list(optional)
         self._opt  = list(optional)
         self._vars: dict[str, tk.BooleanVar] = {}
         self._canvas: tk.Canvas | None = None
         self._inner: ttk.Frame | None = None
+        self._on_change = on_change
+        self._suspend_notify = False
         self._build()
 
     # ──────────────────────────────────────────────────
@@ -66,6 +76,7 @@ class FieldSelector(ttk.Frame):
         self._populate()
 
     def _populate(self) -> None:
+        prev_selected = {f for f, v in self._vars.items() if v.get()}
         for w in self._inner.winfo_children():  # type: ignore[union-attr]
             w.destroy()
         self._vars.clear()
@@ -78,6 +89,7 @@ class FieldSelector(ttk.Frame):
         ).pack(anchor=tk.W, pady=(4, 0))
         for f in self._req:
             var = tk.BooleanVar(value=True)
+            var.trace_add("write", self._notify_change)
             ttk.Checkbutton(
                 self._inner, text=f, variable=var, state="disabled"
             ).pack(anchor=tk.W, padx=16)
@@ -90,7 +102,8 @@ class FieldSelector(ttk.Frame):
             font=("Segoe UI", 8, "italic"),
         ).pack(anchor=tk.W, pady=(10, 0))
         for f in self._opt:
-            var = tk.BooleanVar(value=False)
+            var = tk.BooleanVar(value=f in prev_selected)
+            var.trace_add("write", self._notify_change)
             ttk.Checkbutton(
                 self._inner, text=f, variable=var
             ).pack(anchor=tk.W, padx=16)
@@ -98,18 +111,28 @@ class FieldSelector(ttk.Frame):
 
         self._inner.update_idletasks()  # type: ignore[union-attr]
 
+    def _notify_change(self, *_args) -> None:
+        if not self._suspend_notify and self._on_change is not None:
+            self._on_change()
+
     def _scroll(self, event: tk.Event) -> None:
         self._canvas.yview_scroll(-1 * (event.delta // 120), "units")  # type: ignore[union-attr]
 
     def _select_all(self) -> None:
+        self._suspend_notify = True
         for f, v in self._vars.items():
             if f not in self._req:
                 v.set(True)
+        self._suspend_notify = False
+        self._notify_change()
 
     def _deselect_all(self) -> None:
+        self._suspend_notify = True
         for f, v in self._vars.items():
             if f not in self._req:
                 v.set(False)
+        self._suspend_notify = False
+        self._notify_change()
 
     # ── public ─────────────────────────────────────────
     def add_optional_fields(self, fields: list[str]) -> int:
@@ -126,10 +149,25 @@ class FieldSelector(ttk.Frame):
     def get_selected(self) -> list[str]:
         return [f for f, v in self._vars.items() if v.get()]
 
+    def get_optional_fields(self) -> list[str]:
+        return list(self._opt)
+
     def set_selected(self, selected_fields: list[str]) -> None:
         selected = set(selected_fields)
+        self._suspend_notify = True
         for f, v in self._vars.items():
             if f in self._req:
                 v.set(True)
             else:
                 v.set(f in selected)
+        self._suspend_notify = False
+        self._notify_change()
+
+    def reset_optional_fields(self) -> int:
+        """Clear all optional fields, leaving only required fields. Returns removed count."""
+        removed = len(self._opt)
+        self._opt = []
+        self._opt_base = []
+        self._populate()
+        self._notify_change()
+        return removed

@@ -25,6 +25,7 @@ class ImagesUploadTab(ttk.Frame):
         self._app = app
         self._running = False
         self._headers: list[str] = []
+        self._folder_item_paths: dict[str, Path] = {}
         self._build()
 
     def _build(self) -> None:
@@ -132,12 +133,39 @@ class ImagesUploadTab(ttk.Frame):
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ysb.pack(side=tk.RIGHT, fill=tk.Y)
 
+        ttk.Label(self, text="Scanned Image Folders (double-click to open):", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
+        folder_wrap = ttk.Frame(self)
+        folder_wrap.pack(fill=tk.BOTH, expand=False, padx=8, pady=(2, 6))
+        self._folder_tree = ttk.Treeview(
+            folder_wrap,
+            columns=("folder", "status", "files"),
+            show="headings",
+            height=5,
+        )
+        self._folder_tree.heading("folder", text="Folder")
+        self._folder_tree.heading("status", text="Status")
+        self._folder_tree.heading("files", text="File Count")
+        self._folder_tree.column("folder", width=420, anchor=tk.W)
+        self._folder_tree.column("status", width=120, anchor=tk.CENTER)
+        self._folder_tree.column("files", width=90, anchor=tk.CENTER)
+        fysb = ttk.Scrollbar(folder_wrap, orient=tk.VERTICAL, command=self._folder_tree.yview)
+        self._folder_tree.configure(yscrollcommand=fysb.set)
+        self._folder_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fysb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._folder_tree.bind("<Double-1>", lambda _e: self._open_selected_folder())
+
+        folder_btns = ttk.Frame(self)
+        folder_btns.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Button(folder_btns, text="Refresh Folder List", command=self._refresh_folder_list).pack(side=tk.LEFT)
+        ttk.Button(folder_btns, text="Open Selected Folder", command=self._open_selected_folder).pack(side=tk.LEFT, padx=(6, 0))
+
         ttk.Label(self, text="Images Upload Log:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
         self._log_box = scrolledtext.ScrolledText(self, state="disabled", font=("Consolas", 8))
         self._log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         self._refresh_fields()
         self._sync_field_mode()
+        self._refresh_folder_list()
 
     def _log(self, msg: str) -> None:
         self._app.log(self._log_box, msg)
@@ -153,12 +181,16 @@ class ImagesUploadTab(ttk.Frame):
         clean = re.sub(r"[^A-Za-z0-9._-]+", "_", (field_name or "").strip())
         return clean[:40] or "img"
 
+    def _field_folder_name(self, field_name: str) -> str:
+        clean = re.sub(r"[^A-Za-z0-9._-]+", "_", (field_name or "").strip())
+        return clean[:80] or "images"
+
     def _sku_files(self, sku: str) -> list[Path]:
         folder = Path(IMAGE_DIR)
         if not folder.exists():
             return []
         prefix = self._safe_sku(sku)
-        return sorted([p for p in folder.glob(f"{prefix}*.*") if p.is_file()])
+        return sorted([p for p in folder.rglob(f"{prefix}*.*") if p.is_file()])
 
     def _image_payload_for_sku(self, sku: str) -> list[dict]:
         files = self._sku_files(sku)
@@ -175,13 +207,21 @@ class ImagesUploadTab(ttk.Frame):
         db = Path(DATABASE_FILE)
         if not db.exists():
             raise FileNotFoundError(f"Cannot find {DATABASE_FILE}")
-        wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            return [], []
-        headers = [str(h or "").strip() for h in rows[0]]
-        return headers, rows[1:]
+        wb = None
+        try:
+            wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
+            ws = wb.active
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                return [], []
+            headers = [str(h or "").strip() for h in rows[0]]
+            return headers, rows[1:]
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
     def _image_src_fields(self, headers: list[str]) -> list[str]:
         out: list[str] = []
@@ -236,6 +276,61 @@ class ImagesUploadTab(ttk.Frame):
         manifest.write_text(text + "\n", encoding="utf-8")
         return manifest
 
+    def _refresh_folder_list(self) -> None:
+        root = Path(IMAGE_DIR)
+        root.mkdir(exist_ok=True)
+
+        for item in self._folder_tree.get_children():
+            self._folder_tree.delete(item)
+        self._folder_item_paths.clear()
+
+        paths: list[Path] = [root]
+        existing_subfolders = sorted([p for p in root.iterdir() if p.is_dir()])
+        paths.extend(existing_subfolders)
+
+        if self._headers:
+            for field in self._selected_image_fields(self._headers):
+                folder_name = self._field_folder_name(field)
+                p = root / folder_name
+                if p not in paths:
+                    paths.append(p)
+
+        seen: set[Path] = set()
+        ordered_paths: list[Path] = []
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            ordered_paths.append(p)
+
+        for idx, p in enumerate(ordered_paths, start=1):
+            if p == root:
+                label = "."
+            else:
+                label = str(p.relative_to(root)).replace("\\", "/")
+            exists = p.exists()
+            file_count = len([f for f in p.iterdir() if f.is_file()]) if exists else 0
+            status = "HAS" if exists else "NOT DOWNLOADED YET"
+            iid = f"folder-{idx}"
+            self._folder_item_paths[iid] = p
+            self._folder_tree.insert("", tk.END, iid=iid, values=(label, status, str(file_count)))
+
+    def _open_selected_folder(self) -> None:
+        sel = self._folder_tree.selection()
+        if not sel:
+            messagebox.showwarning("No Selection", "Select a folder in list first.", parent=self)
+            return
+        path = self._folder_item_paths.get(sel[0])
+        if path is None:
+            return
+        path.mkdir(parents=True, exist_ok=True)
+        self._app.set_status(f"Folder ready: {path.resolve()}")
+        try:
+            import os
+            os.startfile(str(path.resolve()))
+        except Exception:
+            messagebox.showinfo("Folder", f"Folder: {path.resolve()}", parent=self)
+
     def _start_download_images(self) -> None:
         if self._running:
             messagebox.showwarning("Busy", "Another image task is running.", parent=self)
@@ -273,8 +368,8 @@ class ImagesUploadTab(ttk.Frame):
                 self._prog.configure(maximum=max(total, 1), value=0)
                 self._app.start_prog("determinate")
 
-                folder = Path(IMAGE_DIR)
-                folder.mkdir(exist_ok=True)
+                root_folder = Path(IMAGE_DIR)
+                root_folder.mkdir(exist_ok=True)
 
                 for i, row in enumerate(data_rows, start=1):
                     product_id = ""
@@ -305,14 +400,12 @@ class ImagesUploadTab(ttk.Frame):
                             ext = Path(urlparse(url).path).suffix.lower()
                             if ext not in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
                                 ext = ".jpg"
+                            field_folder = root_folder / self._field_folder_name(field_name)
+                            field_folder.mkdir(parents=True, exist_ok=True)
                             suffix = self._field_suffix(field_name)
                             file_name = f"{safe_sku}_{suffix}{ext}"
-                            target = folder / file_name
-                            k = 2
-                            while target.exists():
-                                target = folder / f"{safe_sku}_{suffix}_{k}{ext}"
-                                k += 1
-                            file_name = target.name
+                            target = field_folder / file_name
+                            file_name = str(target.relative_to(root_folder)).replace("\\", "/")
                             resp = requests.get(url, timeout=30)
                             resp.raise_for_status()
                             target.write_bytes(resp.content)
@@ -334,6 +427,7 @@ class ImagesUploadTab(ttk.Frame):
                 self._log(f"Download done. OK:{ok_count} FAIL:{fail_count} SKIP:{skip_count}")
                 self._app.set_status("Images download completed")
                 self._scan_folder_coverage()
+                self._refresh_folder_list()
             except Exception as exc:
                 self._log(f"ERROR: {exc}")
                 self._app.set_status("Images download failed")
@@ -389,6 +483,7 @@ class ImagesUploadTab(ttk.Frame):
 
         self._stats.set(f"Coverage: HAS {has_count} | MISSING {miss_count} | Rows {len(data_rows)}")
         self._log(f"Coverage scan done: HAS {has_count}, MISSING {miss_count}, rows {len(data_rows)}")
+        self._refresh_folder_list()
 
     def _delete_selected_images(self) -> None:
         sel = self._tree.selection()
@@ -415,6 +510,7 @@ class ImagesUploadTab(ttk.Frame):
 
         self._log(f"Deleted {removed} local image file(s) from selected rows.")
         self._scan_folder_coverage()
+        self._refresh_folder_list()
 
     def _open_folder(self) -> None:
         folder = Path(IMAGE_DIR)
@@ -452,6 +548,7 @@ class ImagesUploadTab(ttk.Frame):
             self._app.start_prog("indeterminate")
             self._log("Starting images upload by SKU…")
             ok_count = fail_count = skip_count = 0
+            wb = None
 
             try:
                 wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
@@ -534,6 +631,11 @@ class ImagesUploadTab(ttk.Frame):
                 self._app.set_status("Images upload failed")
                 messagebox.showerror("Images Upload Error", str(exc), parent=self)
             finally:
+                if wb is not None:
+                    try:
+                        wb.close()
+                    except Exception:
+                        pass
                 self._running = False
                 self._app.stop_prog()
 

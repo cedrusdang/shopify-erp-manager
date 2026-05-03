@@ -14,46 +14,9 @@ DEFAULT_SKU = "default"
 REQUIRED_FIELDS: list[str] = [
     "id",
     "title",
-    "vendor",
-    "product_type",
-    "tags",
-    "status",
-]
-
-OPTIONAL_FIELDS: list[str] = [
-    "body_html",
     "handle",
-    "created_at",
-    "updated_at",
-    "published_at",
-    "template_suffix",
-    "published_scope",
-    "admin_graphql_api_id",
-    "variants.0.id",
     "variants.0.sku",
-    "variants.0.title",
-    "variants.0.price",
-    "variants.0.compare_at_price",
-    "variants.0.inventory_quantity",
-    "variants.0.weight",
-    "variants.0.weight_unit",
-    "variants.0.barcode",
-    "variants.0.option1",
-    "variants.0.option2",
-    "variants.0.option3",
-    "variants.0.taxable",
-    "variants.0.requires_shipping",
-    "images.0.src",
-    "images.0.alt",
-    "options.0.name",
-    "options.0.values.0",
 ]
-
-# Top-level product keys that are safe to send back via PUT
-UPDATABLE_TOP: set[str] = {
-    "title", "body_html", "vendor", "product_type",
-    "tags", "status", "handle", "published",
-}
 
 INSTRUCTIONS = f"""\
 SHOPIFY ERP MANAGER — User Guide  v{APP_VER}

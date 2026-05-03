@@ -150,6 +150,7 @@ class LiveDatabasePanel(ttk.LabelFrame):
             self._last_mtime = None
             return
 
+        wb = None
         try:
             wb = openpyxl.load_workbook(self._db_path, read_only=True, data_only=True)
             ws = wb.active
@@ -174,6 +175,12 @@ class LiveDatabasePanel(ttk.LabelFrame):
         except Exception as exc:
             self._status.set(f"Read error: {exc}")
             return
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
         if not rows:
             self._clear_tree()

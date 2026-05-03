@@ -26,6 +26,7 @@ from .tab_settings import SettingsTab
 from .tab_help     import HelpTab
 from .tab_images_upload import ImagesUploadTab
 from .tab_logs     import LogsTab
+from .tab_shopify_mimic import ShopifyMimicTab
 from .live_database_panel import LiveDatabasePanel
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,7 @@ class ShopifyERPApp(tk.Tk):
         self._tab_logs.start_auto_refresh()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._auto_initialize_connection)
+        self._busy_cursor_locks = 0
 
         # Let upload tab know about any saved session
         self._tab_upload.check_resume_session()
@@ -168,6 +170,7 @@ class ShopifyERPApp(tk.Tk):
         self._tab_upload   = UploadTab(nb, self)
         self._tab_backup   = BackupTab(nb, self)
         self._tab_images   = ImagesUploadTab(nb, self)
+        self._tab_mimic    = ShopifyMimicTab(nb, self)
         self._tab_settings = SettingsTab(nb, self)
         self._tab_help     = HelpTab(nb, self)
         self._tab_logs     = LogsTab(nb, self)
@@ -184,6 +187,7 @@ class ShopifyERPApp(tk.Tk):
         nb.add(self._tab_download, text="  ⬇  Download  ")
         nb.add(self._tab_upload,   text="  ⬆  Upload  ")
         nb.add(self._tab_images,   text="  🖼  Images Upload  ")
+        nb.add(self._tab_mimic,    text="  🛍  Shopify Mimic  ")
         nb.add(self._tab_backup,   text="  💾  Backup  ")
         nb.add(self._tab_live_full, text="  🗄  Live DB (Full)  ")
         nb.add(self._tab_logs,     text="  📋  Logs  ")
@@ -222,7 +226,21 @@ class ShopifyERPApp(tk.Tk):
         widget.see(tk.END)
         widget.config(state="disabled")
 
-    def start_prog(self, mode: str = "indeterminate") -> None:
+    def _acquire_busy_cursor(self) -> None:
+        self._busy_cursor_locks += 1
+        if self._busy_cursor_locks == 1:
+            self.config(cursor="watch")
+            self.update_idletasks()
+
+    def _release_busy_cursor(self) -> None:
+        self._busy_cursor_locks = max(0, self._busy_cursor_locks - 1)
+        if self._busy_cursor_locks == 0:
+            self.config(cursor="")
+            self.update_idletasks()
+
+    def start_prog(self, mode: str = "indeterminate", use_busy_cursor: bool = True) -> None:
+        if use_busy_cursor:
+            self._acquire_busy_cursor()
         self._prog.config(mode=mode)
         if mode == "indeterminate":
             self._prog.start(10)
@@ -230,9 +248,11 @@ class ShopifyERPApp(tk.Tk):
             self._prog.stop()
             self._prog["value"] = 0
 
-    def stop_prog(self) -> None:
+    def stop_prog(self, clear_busy_cursor: bool = True) -> None:
         self._prog.stop()
         self._prog.config(mode="determinate", value=0)
+        if clear_busy_cursor:
+            self._release_busy_cursor()
 
     def set_prog_value(self, value: int, maximum: int) -> None:
         self._prog["maximum"] = maximum
@@ -370,6 +390,7 @@ class ShopifyERPApp(tk.Tk):
     def refresh_live_database(self) -> None:
         self._live_db.refresh_data()
         self._live_db_full.refresh_data()
+        self._tab_mimic.refresh_data()
 
     def _on_tab_changed(self, _event) -> None:
         """Give near-full workspace to dedicated Live DB tab when selected."""
