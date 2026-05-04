@@ -70,6 +70,7 @@ class ImagesUploadTab(ttk.Frame):
         self._sku_pick = tk.StringVar(value="")
         self._sku_combo = ttk.Combobox(sku_row, textvariable=self._sku_pick, state="disabled", width=36)
         self._sku_combo.pack(side=tk.LEFT, padx=(6, 6), fill=tk.X, expand=True)
+        self._sku_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_sku_changed())
 
         field_row = ttk.Frame(options)
         field_row.pack(fill=tk.X)
@@ -257,6 +258,29 @@ class ImagesUploadTab(ttk.Frame):
             self._sku_combo.configure(state="disabled")
         else:
             self._sku_combo.configure(state="readonly")
+        self._scan_folder_coverage()
+
+    def _on_sku_changed(self) -> None:
+        self._scan_folder_coverage()
+
+    def _highlight_selected_sku_row(self) -> None:
+        target_sku = self._selected_sku()
+        if not target_sku:
+            self._tree.selection_remove(self._tree.selection())
+            return
+
+        matched_iid = None
+        for iid in self._tree.get_children():
+            vals = self._tree.item(iid, "values")
+            sku_val = str(vals[1]).strip() if len(vals) > 1 else ""
+            if sku_val == target_sku:
+                matched_iid = iid
+                break
+
+        if matched_iid is not None:
+            self._tree.selection_set(matched_iid)
+            self._tree.focus(matched_iid)
+            self._tree.see(matched_iid)
 
     def _on_field_changed(self) -> None:
         self._refresh_folder_list()
@@ -553,15 +577,12 @@ class ImagesUploadTab(ttk.Frame):
         sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
         src_fields = self._selected_image_fields(headers)
         src_idx = [headers.index(f) for f in src_fields]
-        selected_sku = self._selected_sku()
 
         has_count = 0
         miss_count = 0
         for i, row in enumerate(data_rows, start=1):
             product_id = str(row[id_idx]).strip() if id_idx >= 0 and id_idx < len(row) and row[id_idx] not in (None, "") else ""
             sku = str(row[sku_idx]).strip() if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, "") else DEFAULT_SKU
-            if selected_sku and sku != selected_sku:
-                continue
             files = self._sku_files_for_field(sku, src_fields[0]) if src_fields else []
             url_count = 0
             for fi in src_idx:
@@ -583,6 +604,7 @@ class ImagesUploadTab(ttk.Frame):
 
         self._stats.set(f"Coverage: HAS {has_count} | MISSING {miss_count} | Rows {len(data_rows)}")
         self._log(f"Coverage scan done: HAS {has_count}, MISSING {miss_count}, rows {len(data_rows)}")
+        self._highlight_selected_sku_row()
         self._refresh_folder_list()
 
     def _delete_selected_images(self) -> None:
