@@ -26,6 +26,7 @@ from .tab_backup   import BackupTab
 from .tab_settings import SettingsTab
 from .tab_help     import HelpTab
 from .tab_images_download import ImagesDownloadTab
+from .tab_images_upload import ImagesUploadTab
 from .tab_logs     import LogsTab
 from .tab_shopify_mimic import ShopifyMimicTab
 from .live_database_panel import LiveDatabasePanel
@@ -170,7 +171,8 @@ class ShopifyERPApp(tk.Tk):
         self._tab_download = DownloadTab(nb, self)
         self._tab_upload   = UploadTab(nb, self)
         self._tab_backup   = BackupTab(nb, self)
-        self._tab_images   = ImagesDownloadTab(nb, self)
+        self._tab_images_dl = ImagesDownloadTab(nb, self)
+        self._tab_images_up = ImagesUploadTab(nb, self)
         self._tab_mimic    = ShopifyMimicTab(nb, self)
         self._tab_settings = SettingsTab(nb, self)
         self._tab_help     = HelpTab(nb, self)
@@ -187,7 +189,8 @@ class ShopifyERPApp(tk.Tk):
 
         nb.add(self._tab_download, text="  ⬇  Download  ")
         nb.add(self._tab_upload,   text="  ⬆  Upload  ")
-        nb.add(self._tab_images,   text="  🖼  Image Download  ")
+        nb.add(self._tab_images_dl, text="  🖼  Image Download  ")
+        nb.add(self._tab_images_up, text="  🖼  Image Upload  ")
         nb.add(self._tab_mimic,    text="  🛍  Shopify Mimic  ")
         nb.add(self._tab_backup,   text="  💾  Backup  ")
         nb.add(self._tab_live_full, text="  🗄  Live DB (Full)  ")
@@ -425,8 +428,8 @@ class ShopifyERPApp(tk.Tk):
     def _on_tab_changed(self, _event) -> None:
         """Give near-full workspace to dedicated Live DB tab when selected."""
         selected = self._notebook.select()
-        # Image tab needs maximum vertical room for SKU/folders/log workflow.
-        if selected in {str(self._tab_live_full), str(self._tab_images)}:
+        # Image tabs need maximum vertical room for SKU/folders/log workflow.
+        if selected in {str(self._tab_live_full), str(self._tab_images_dl), str(self._tab_images_up)}:
             self.after(10, lambda: self._split.sashpos(0, int(self.winfo_height() * 0.92)))
         else:
             self.after(10, lambda: self._split.sashpos(0, int(self.winfo_height() * 0.62)))
