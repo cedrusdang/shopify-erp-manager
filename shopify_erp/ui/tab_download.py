@@ -5,6 +5,7 @@ Download tab — fetch products from Shopify and save to Excel.
 from __future__ import annotations
 
 import re
+import json
 import logging
 import threading
 from datetime import datetime
@@ -158,7 +159,7 @@ class DownloadTab(ttk.Frame):
 
         ttk.Label(
             right,
-            text="Image download moved to 'Image Download Upload' tab.",
+            text="Image download moved to 'Image Download' tab.",
             foreground="#666",
             wraplength=210,
             font=("Segoe UI", 8),
@@ -378,6 +379,18 @@ class DownloadTab(ttk.Frame):
                     ok += 1
                 except Exception:
                     fail += 1
+                    self._log(
+                        "Image download FAIL context -> "
+                        + json.dumps(
+                            {
+                                "product_id": str(get_by_path(p, "id") or ""),
+                                "sku": sku,
+                                "field": image_field,
+                                "url": src,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
 
         return ok, fail
 
@@ -632,8 +645,8 @@ class DownloadTab(ttk.Frame):
                     self._set_progress_step("fetch", "DONE", f"{total} products + metafields")
 
                 current_step = "images"
-                self._set_progress_step("images", "SKIPPED", "Use Image Download Upload tab")
-                self._log("Image handling is managed in 'Image Download Upload' tab.")
+                self._set_progress_step("images", "SKIPPED", "Use Image Download tab")
+                self._log("Image handling is managed in 'Image Download' tab.")
 
                 self._app.start_prog("determinate", use_busy_cursor=False)
 
@@ -694,7 +707,10 @@ class DownloadTab(ttk.Frame):
                 self._set_progress_step("run", "DONE", "Completed")
                 
                 logger.info(f"Download completed successfully: {total} products, {len(fields)} fields")
-                open_file(out)
+                self._log(
+                    "Download finished. Auto-open skipped to avoid Excel file lock; "
+                    "use 'Open Current File' when needed."
+                )
 
             except Exception as exc:
                 logger.exception(f"Download error: {exc}")
@@ -702,6 +718,21 @@ class DownloadTab(ttk.Frame):
                 self._set_progress_step("finish", "FAILED", "Download failed")
                 self._set_progress_step("run", "FAILED", "Stopped by error")
                 self._log(f"ERROR: {exc}")
+                self._log(
+                    "Download FAIL context -> "
+                    + json.dumps(
+                        {
+                            "mode": mode,
+                            "page": page_no,
+                            "from_page": page_from,
+                            "to_page": page_to,
+                            "selected_fields": fields,
+                            "current_step": current_step,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
                 self._app.set_status("Download failed")
                 messagebox.showerror("Download Error", str(exc), parent=self)
             finally:

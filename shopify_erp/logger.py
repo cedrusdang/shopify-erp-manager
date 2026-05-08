@@ -44,6 +44,7 @@ def setup_logging(log_dir: str = "logs") -> logging.Logger:
         log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB
         backupCount=10,  # Keep 10 backup files
+        encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(detailed_formatter)
@@ -55,6 +56,7 @@ def setup_logging(log_dir: str = "logs") -> logging.Logger:
         error_log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB
         backupCount=10,
+        encoding="utf-8",
     )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(detailed_formatter)

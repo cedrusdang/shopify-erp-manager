@@ -119,8 +119,13 @@ class LogsTab(ttk.Frame):
             return
 
         try:
-            with open(log_file, "r", encoding="utf-8") as f:
-                content = f.read()
+            try:
+                with open(log_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                # Backward compatibility for older logs written with legacy Windows encodings.
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
 
             self._log_text.config(state="normal")
             self._log_text.delete(1.0, tk.END)
@@ -199,7 +204,7 @@ class LogsTab(ttk.Frame):
             return
 
         try:
-            log_file.write_text("")
+            log_file.write_text("", encoding="utf-8")
             logger.info(f"Log file cleared: {log_file.name}")
             messagebox.showinfo("Success", f"Log file cleared:\n{log_file.name}", parent=self)
             self._refresh_logs()

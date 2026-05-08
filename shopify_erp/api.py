@@ -651,66 +651,125 @@ def enrich_products_with_metafields(
     )
     need_variant_mf = any(f.startswith("variants.") and ".metafields." in f for f in fields)
 
+    def _extract_requested_pairs(prefix: str) -> set[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        needle = f"{prefix}."
+        for f in fields:
+            if not f.startswith(needle):
+                continue
+            tail = f[len(needle):]
+            parts = tail.split(".", 2)
+            if len(parts) < 2:
+                continue
+            ns = parts[0].strip()
+            key = parts[1].strip()
+            if ns and key:
+                pairs.add((ns, key))
+        return pairs
+
     if not need_product_mf and not need_variant_mf:
         return
 
+    requested_product_pairs = _extract_requested_pairs("metafields")
+    requested_variant_pairs = _extract_requested_pairs("variants.0.metafields")
+    # For a small selected key set, targeted query per key is faster than pulling all metafields.
+    use_targeted_product = need_product_mf and 0 < len(requested_product_pairs) <= 2
+    use_targeted_variant = need_variant_mf and 0 < len(requested_variant_pairs) <= 2
+
     base = _rest_base_url(store)
-    hdrs = _headers(token)
     total = len(products)
+    session = requests.Session()
+    session.headers.update(_headers(token))
 
-    for idx, p in enumerate(products):
-        pid = str(p.get("id", "")).strip()
-        if on_progress and idx % 10 == 0:
-            on_progress(f"Fetching metafields {idx + 1}/{total}…")
+    try:
+        for idx, p in enumerate(products):
+            pid = str(p.get("id", "")).strip()
+            if on_progress and idx % 10 == 0:
+                on_progress(f"Fetching metafields {idx + 1}/{total}…")
 
-        if need_product_mf and pid:
-            try:
-                resp = requests.get(
-                    f"{base}/products/{quote(pid)}/metafields.json",
-                    headers=hdrs,
-                    params={"limit": 250},
-                    timeout=30,
-                )
-                if resp.ok:
-                    mf_dict: dict = p.setdefault("metafields", {})
-                    for mf in resp.json().get("metafields", []):
-                        if not isinstance(mf, dict):
-                            continue
-                        ns = str(mf.get("namespace", "")).strip()
-                        key = str(mf.get("key", "")).strip()
-                        val = mf.get("value", "")
-                        if ns and key:
-                            mf_dict.setdefault(ns, {})[key] = val
-            except Exception:
-                pass
-
-        if need_variant_mf:
-            variants = p.get("variants") or []
-            for v in variants:
-                if not isinstance(v, dict):
-                    continue
-                vid = str(v.get("id", "")).strip()
-                if not vid:
-                    continue
+            if need_product_mf and pid:
                 try:
-                    resp = requests.get(
-                        f"{base}/variants/{quote(vid)}/metafields.json",
-                        headers=hdrs,
-                        params={"limit": 250},
-                        timeout=30,
-                    )
-                    if resp.ok:
-                        vmf_dict: dict = v.setdefault("metafields", {})
-                        for mf in resp.json().get("metafields", []):
-                            if not isinstance(mf, dict):
+                    mf_dict: dict = p.setdefault("metafields", {})
+                    if use_targeted_product:
+                        for ns, key in requested_product_pairs:
+                            resp = session.get(
+                                f"{base}/products/{quote(pid)}/metafields.json",
+                                params={"namespace": ns, "key": key, "limit": 1},
+                                timeout=20,
+                            )
+                            if not resp.ok:
                                 continue
-                            ns = str(mf.get("namespace", "")).strip()
-                            key = str(mf.get("key", "")).strip()
+                            items = resp.json().get("metafields", [])
+                            if not items:
+                                continue
+                            mf = items[0] if isinstance(items[0], dict) else {}
                             val = mf.get("value", "")
-                            if ns and key:
-                                vmf_dict.setdefault(ns, {})[key] = val
+                            mf_dict.setdefault(ns, {})[key] = val
+                    else:
+                        resp = session.get(
+                            f"{base}/products/{quote(pid)}/metafields.json",
+                            params={"limit": 250},
+                            timeout=30,
+                        )
+                        if resp.ok:
+                            for mf in resp.json().get("metafields", []):
+                                if not isinstance(mf, dict):
+                                    continue
+                                ns = str(mf.get("namespace", "")).strip()
+                                key = str(mf.get("key", "")).strip()
+                                val = mf.get("value", "")
+                                if ns and key:
+                                    mf_dict.setdefault(ns, {})[key] = val
                 except Exception:
                     pass
+
+            if need_variant_mf:
+                variants = p.get("variants") or []
+                for v in variants:
+                    if not isinstance(v, dict):
+                        continue
+                    vid = str(v.get("id", "")).strip()
+                    if not vid:
+                        continue
+                    try:
+                        vmf_dict: dict = v.setdefault("metafields", {})
+                        if use_targeted_variant:
+                            for ns, key in requested_variant_pairs:
+                                resp = session.get(
+                                    f"{base}/variants/{quote(vid)}/metafields.json",
+                                    params={"namespace": ns, "key": key, "limit": 1},
+                                    timeout=20,
+                                )
+                                if not resp.ok:
+                                    continue
+                                items = resp.json().get("metafields", [])
+                                if not items:
+                                    continue
+                                mf = items[0] if isinstance(items[0], dict) else {}
+                                val = mf.get("value", "")
+                                vmf_dict.setdefault(ns, {})[key] = val
+                        else:
+                            resp = session.get(
+                                f"{base}/variants/{quote(vid)}/metafields.json",
+                                params={"limit": 250},
+                                timeout=30,
+                            )
+                            if resp.ok:
+                                for mf in resp.json().get("metafields", []):
+                                    if not isinstance(mf, dict):
+                                        continue
+                                    ns = str(mf.get("namespace", "")).strip()
+                                    key = str(mf.get("key", "")).strip()
+                                    val = mf.get("value", "")
+                                    if ns and key:
+                                        vmf_dict.setdefault(ns, {})[key] = val
+                    except Exception:
+                        pass
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
     if on_progress:
         on_progress(f"Metafields fetched for {total} products.")

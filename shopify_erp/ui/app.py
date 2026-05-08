@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from tkinter import scrolledtext
@@ -24,7 +25,7 @@ from .tab_upload   import UploadTab
 from .tab_backup   import BackupTab
 from .tab_settings import SettingsTab
 from .tab_help     import HelpTab
-from .tab_images_upload import ImagesUploadTab
+from .tab_images_download import ImagesDownloadTab
 from .tab_logs     import LogsTab
 from .tab_shopify_mimic import ShopifyMimicTab
 from .live_database_panel import LiveDatabasePanel
@@ -169,7 +170,7 @@ class ShopifyERPApp(tk.Tk):
         self._tab_download = DownloadTab(nb, self)
         self._tab_upload   = UploadTab(nb, self)
         self._tab_backup   = BackupTab(nb, self)
-        self._tab_images   = ImagesUploadTab(nb, self)
+        self._tab_images   = ImagesDownloadTab(nb, self)
         self._tab_mimic    = ShopifyMimicTab(nb, self)
         self._tab_settings = SettingsTab(nb, self)
         self._tab_help     = HelpTab(nb, self)
@@ -186,7 +187,7 @@ class ShopifyERPApp(tk.Tk):
 
         nb.add(self._tab_download, text="  ⬇  Download  ")
         nb.add(self._tab_upload,   text="  ⬆  Upload  ")
-        nb.add(self._tab_images,   text="  🖼  Image Download Upload  ")
+        nb.add(self._tab_images,   text="  🖼  Image Download  ")
         nb.add(self._tab_mimic,    text="  🛍  Shopify Mimic  ")
         nb.add(self._tab_backup,   text="  💾  Backup  ")
         nb.add(self._tab_live_full, text="  🗄  Live DB (Full)  ")
@@ -225,28 +226,21 @@ class ShopifyERPApp(tk.Tk):
         widget.insert(tk.END, f"[{datetime.now():%H:%M:%S}] {msg}\n")
         widget.see(tk.END)
         widget.config(state="disabled")
+        # Persist tab-level UI log lines into file logs for later troubleshooting.
+        logger.info(msg)
 
     def _acquire_busy_cursor(self) -> None:
-        self._busy_cursor_locks += 1
-        if self._busy_cursor_locks == 1:
-            self.config(cursor="watch")
-            self.update_idletasks()
+        # Busy cursor disabled - rely on status text instead
+        pass
 
     def _release_busy_cursor(self) -> None:
-        self._busy_cursor_locks = max(0, self._busy_cursor_locks - 1)
-        if self._busy_cursor_locks == 0:
-            self.config(cursor="")
-            self.update_idletasks()
+        # Busy cursor disabled - rely on status text instead
+        pass
 
     def start_prog(self, mode: str = "indeterminate", use_busy_cursor: bool = True) -> None:
-        if use_busy_cursor:
-            self._acquire_busy_cursor()
-        self._prog.config(mode=mode)
-        if mode == "indeterminate":
-            self._prog.start(10)
-        else:
-            self._prog.stop()
-            self._prog["value"] = 0
+        # Indeterminate spinner disabled - use status text instead
+        self._prog.config(mode="determinate", value=0)
+        self._prog.stop()
 
     def stop_prog(self, clear_busy_cursor: bool = True) -> None:
         self._prog.stop()
@@ -265,7 +259,7 @@ class ShopifyERPApp(tk.Tk):
         return messagebox.askyesno(title, msg, parent=self)
 
     def get_conn(self) -> tuple[str | None, str | None]:
-        s = self.store.get().strip().rstrip("/")
+        s = self._normalize_store_domain(self.store.get())
         t = self.token.get().strip()
         if not s or not t:
             messagebox.showwarning(
@@ -274,7 +268,30 @@ class ShopifyERPApp(tk.Tk):
                 parent=self,
             )
             return None, None
+        if not self._is_valid_store_domain(s):
+            messagebox.showwarning(
+                "Invalid Store Domain",
+                "Store Domain looks invalid. Please use a valid host like mystore.myshopify.com",
+                parent=self,
+            )
+            return None, None
         return s, t
+
+    def _normalize_store_domain(self, raw: str) -> str:
+        s = (raw or "").strip()
+        if s.startswith(("http://", "https://")):
+            s = s.split("://", 1)[1]
+        s = s.split("/", 1)[0].strip().rstrip(".")
+        return s
+
+    def _is_valid_store_domain(self, store: str) -> bool:
+        s = (store or "").strip().lower()
+        if not s or " " in s:
+            return False
+        # Reject placeholder-masked hosts like xxxxx or ***** that cannot resolve.
+        if re.fullmatch(r"[x*._-]+", s):
+            return False
+        return re.fullmatch(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}", s) is not None
 
     def _set_token(self, value: str) -> None:
         self._token_entry.configure(state="normal")
@@ -301,7 +318,7 @@ class ShopifyERPApp(tk.Tk):
         messagebox.showinfo("Copied", "API token copied to clipboard.", parent=self)
 
     def _fetch_token_clicked(self) -> None:
-        store = self.store.get().strip().rstrip("/")
+        store = self._normalize_store_domain(self.store.get())
         client_id = self.client_id.get().strip()
         client_secret = self.client_secret.get().strip()
 
@@ -310,6 +327,14 @@ class ShopifyERPApp(tk.Tk):
             messagebox.showwarning(
                 "Missing Credentials",
                 "Please provide Store Domain, Client ID, and Client Secret.",
+                parent=self,
+            )
+            return
+
+        if not self._is_valid_store_domain(store):
+            messagebox.showwarning(
+                "Invalid Store Domain",
+                "Store Domain looks invalid. Please use a valid host like mystore.myshopify.com",
                 parent=self,
             )
             return
@@ -341,13 +366,18 @@ class ShopifyERPApp(tk.Tk):
 
     def _auto_initialize_connection(self) -> None:
         """On app startup: auto-fetch API token and auto-test connection."""
-        store = self.store.get().strip().rstrip("/")
+        store = self._normalize_store_domain(self.store.get())
         client_id = self.client_id.get().strip()
         client_secret = self.client_secret.get().strip()
 
         if not store or not client_id or not client_secret:
             logger.debug("Auto-init skipped: missing Store/Client credentials")
             self.set_status("Auto-init skipped: missing Store/Client credentials")
+            return
+
+        if not self._is_valid_store_domain(store):
+            logger.warning("Auto-init skipped: invalid store domain format")
+            self.set_status("Auto-init skipped: invalid store domain")
             return
 
         logger.info(f"Auto-initializing connection for store: {store}")
@@ -394,7 +424,9 @@ class ShopifyERPApp(tk.Tk):
 
     def _on_tab_changed(self, _event) -> None:
         """Give near-full workspace to dedicated Live DB tab when selected."""
-        if self._notebook.select() == str(self._tab_live_full):
+        selected = self._notebook.select()
+        # Image tab needs maximum vertical room for SKU/folders/log workflow.
+        if selected in {str(self._tab_live_full), str(self._tab_images)}:
             self.after(10, lambda: self._split.sashpos(0, int(self.winfo_height() * 0.92)))
         else:
             self.after(10, lambda: self._split.sashpos(0, int(self.winfo_height() * 0.62)))

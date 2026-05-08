@@ -1,8 +1,9 @@
-"""Image download/upload tools for Shopify products."""
+"""Image download tools for Shopify products."""
 
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import threading
 import time
@@ -18,21 +19,24 @@ import requests
 from ..api import update_product_api
 from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR
 
+logger = logging.getLogger(__name__)
 
-class ImagesUploadTab(ttk.Frame):
+
+class ImagesDownloadTab(ttk.Frame):
     def __init__(self, parent: ttk.Notebook, app):
         super().__init__(parent)
         self._app = app
         self._running = False
         self._headers: list[str] = []
         self._folder_item_paths: dict[str, Path] = {}
-        self._field_vars: dict[str, tk.BooleanVar] = {}
+        self._field_pick = tk.StringVar(value="")
+        self._sku_mode = tk.StringVar(value="all")
         self._build()
 
     def _build(self) -> None:
         ttk.Label(
             self,
-            text="Image Download Upload — download / upload / scan / delete by SKU",
+            text="Image Download — download by selected field and SKU scope",
             font=("Segoe UI", 10, "bold"),
             foreground="#0f6b45",
         ).pack(anchor=tk.W, padx=10, pady=(10, 6))
@@ -44,9 +48,10 @@ class ImagesUploadTab(ttk.Frame):
             text=(
                 f"• Database file: {DATABASE_FILE}\n"
                 f"• Image folder: {IMAGE_DIR}\n"
-                "• Download: choose image URL field(s) from DB.\n"
-                "• Upload mode 1: local files with SKU prefix are sent to Shopify.\n"
-                "• Upload mode 2: send image URLs directly from DB fields (no local pre-download).\n"
+                "• Download: choose one DB field at a time that contains image URLs.\n"
+                "• ID fields are auto-used internally and are not selectable here.\n"
+                "• Folder output uses selected field name as folder.\n"
+                "• Image filename uses SKU only (e.g. ABC123.jpg).\n"
                 "• A text manifest image_sources.txt is written in image folder."
             ),
             justify=tk.LEFT,
@@ -54,20 +59,16 @@ class ImagesUploadTab(ttk.Frame):
             font=("Segoe UI", 9),
         ).pack(anchor=tk.W)
 
-        options = ttk.LabelFrame(self, text=" Shared Options (Download + Upload) ", padding=8)
+        options = ttk.LabelFrame(self, text=" Download Options ", padding=8)
         options.pack(fill=tk.X, padx=8, pady=(4, 2))
 
         sku_row = ttk.Frame(options)
         sku_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(sku_row, text="SKU Scope:").pack(side=tk.LEFT)
-        self._sku_all = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            sku_row,
-            text="All",
-            variable=self._sku_all,
-            command=self._sync_sku_mode,
-        ).pack(side=tk.LEFT, padx=(6, 8))
-        ttk.Label(sku_row, text="SKU:").pack(side=tk.LEFT)
+        ttk.Radiobutton(sku_row, text="All", value="all", variable=self._sku_mode, command=self._sync_sku_mode).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Radiobutton(sku_row, text="Single", value="single", variable=self._sku_mode, command=self._sync_sku_mode).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(sku_row, text="Group", value="group", variable=self._sku_mode, command=self._sync_sku_mode).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(sku_row, text="Single SKU:").pack(side=tk.LEFT)
         self._sku_pick = tk.StringVar(value="")
         _sku_style = ttk.Style()
         _sku_style.map(
@@ -79,12 +80,27 @@ class ImagesUploadTab(ttk.Frame):
         self._sku_combo.pack(side=tk.LEFT, padx=(6, 6), fill=tk.X, expand=True)
         self._sku_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_sku_changed())
 
-        field_row = ttk.Frame(options)
-        field_row.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(field_row, text="Image Fields:").pack(side=tk.LEFT, anchor=tk.NW, pady=3)
-        self._field_frame = ttk.Frame(field_row)
-        self._field_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-        ttk.Button(field_row, text="Refresh Fields", command=self._refresh_fields).pack(side=tk.RIGHT, padx=(4, 0))
+        group_row = ttk.Frame(options)
+        group_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(group_row, text="Group SKU (comma/newline):").pack(side=tk.LEFT)
+        self._sku_group = tk.StringVar(value="")
+        self._sku_group_entry = ttk.Entry(group_row, textvariable=self._sku_group, state="disabled")
+        self._sku_group_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        field_box = ttk.LabelFrame(options, text=" Image Fields ", padding=8)
+        field_box.pack(fill=tk.X, pady=(4, 0))
+        field_tools = ttk.Frame(field_box)
+        field_tools.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            field_tools,
+            text="Select one DB field to treat as the active image field.",
+            foreground="#555",
+        ).pack(side=tk.LEFT)
+        ttk.Button(field_tools, text="Clear", command=self._clear_all_fields).pack(side=tk.RIGHT)
+        ttk.Button(field_tools, text="Refresh Fields", command=self._refresh_fields).pack(side=tk.RIGHT, padx=(6, 0))
+
+        self._field_frame = ttk.Frame(field_box)
+        self._field_frame.pack(fill=tk.X)
 
         btns = ttk.Frame(self)
         btns.pack(fill=tk.X, padx=8, pady=4)
@@ -94,14 +110,7 @@ class ImagesUploadTab(ttk.Frame):
             style="Primary.TButton",
             command=self._start_download_images,
         ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(
-            btns,
-            text="Upload Images by SKU",
-            style="Primary.TButton",
-            command=self._start,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="Scan Folder Coverage", command=self._scan_folder_coverage).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btns, text="Delete Selected SKU Images", command=self._delete_selected_images).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Refresh Coverage", command=self._scan_folder_coverage).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btns, text="Open Image Folder", command=self._open_folder).pack(side=tk.LEFT)
 
         self._stats = tk.StringVar(value="")
@@ -160,7 +169,7 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Button(folder_btns, text="Refresh Folder List", command=self._refresh_folder_list).pack(side=tk.LEFT)
         ttk.Button(folder_btns, text="Open Selected Folder", command=self._open_selected_folder).pack(side=tk.LEFT, padx=(6, 0))
 
-        ttk.Label(self, text="Image Download Upload Log:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
+        ttk.Label(self, text="Image Download Log:", font=("Segoe UI", 9, "bold")).pack(anchor=tk.W, padx=8)
         self._log_box = scrolledtext.ScrolledText(self, state="disabled", font=("Consolas", 8))
         self._log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
@@ -169,7 +178,32 @@ class ImagesUploadTab(ttk.Frame):
         self._refresh_folder_list()
 
     def _log(self, msg: str) -> None:
-        self._app.log(self._log_box, msg)
+        logger.info(f"[ImagesTab] {msg}")
+        try:
+            self.after(0, lambda m=msg: self._app.log(self._log_box, m))
+        except Exception:
+            # Fallback to file logger if UI thread is not ready.
+            logger.debug("[ImagesTab] UI log dispatch skipped", exc_info=True)
+
+    def _log_step(self, step_no: int, title: str, detail: str = "") -> None:
+        if detail:
+            self._log(f"[Step {step_no}] {title} — {detail}")
+        else:
+            self._log(f"[Step {step_no}] {title}")
+
+    def _ui_async(self, fn) -> None:
+        try:
+            self.after(0, fn)
+        except Exception:
+            logger.debug("[ImagesTab] UI async dispatch failed", exc_info=True)
+
+    def _ui_set_upload_progress(self, current: int, total: int, ok_count: int, fail_count: int, skip_count: int) -> None:
+        def _update() -> None:
+            self._prog["maximum"] = max(total, 1)
+            self._prog["value"] = current
+            self._stats.set(f"Row {current}/{total}  OK:{ok_count}  FAIL:{fail_count}  SKIP:{skip_count}")
+
+        self._ui_async(_update)
 
     def _safe_sku(self, value: str) -> str:
         sku = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
@@ -216,6 +250,65 @@ class ImagesUploadTab(ttk.Frame):
                 continue
         return payload
 
+    def _image_payload_for_fields(self, sku: str, field_names: list[str]) -> list[dict]:
+        payload: list[dict] = []
+        for field_name in field_names:
+            payload.extend(self._image_payload_for_sku(sku, field_name))
+        return payload
+
+    def _build_field_sku_file_index(self, field_names: list[str]) -> dict[str, dict[str, list[Path]]]:
+        """Index local image files by selected field and safe SKU.
+
+        This avoids repeated folder scans per DB row during upload.
+        """
+        index: dict[str, dict[str, list[Path]]] = {}
+        root = Path(IMAGE_DIR)
+        if not root.exists():
+            return index
+
+        for field_name in field_names:
+            field_folder = root / self._field_folder_name(field_name)
+            if not field_folder.exists() or not field_folder.is_dir():
+                continue
+
+            suffix = self._field_suffix(field_name)
+            marker = f"_{suffix}"
+            sku_map: dict[str, list[Path]] = {}
+
+            for p in field_folder.iterdir():
+                if not p.is_file():
+                    continue
+                stem = p.stem
+                if marker not in stem:
+                    continue
+                safe_sku = stem.rsplit(marker, 1)[0].strip()
+                if not safe_sku:
+                    continue
+                sku_map.setdefault(safe_sku, []).append(p)
+
+            if sku_map:
+                for one_sku in sku_map:
+                    sku_map[one_sku].sort()
+                index[field_name] = sku_map
+
+        return index
+
+    def _image_payload_from_index(
+        self,
+        safe_sku: str,
+        field_names: list[str],
+        file_index: dict[str, dict[str, list[Path]]],
+    ) -> list[dict]:
+        payload: list[dict] = []
+        for field_name in field_names:
+            for p in file_index.get(field_name, {}).get(safe_sku, []):
+                try:
+                    encoded = base64.b64encode(p.read_bytes()).decode("ascii")
+                    payload.append({"attachment": encoded, "filename": p.name})
+                except Exception:
+                    continue
+        return payload
+
     def _load_db(self) -> tuple[list[str], list[tuple]]:
         db = Path(DATABASE_FILE)
         if not db.exists():
@@ -236,20 +329,27 @@ class ImagesUploadTab(ttk.Frame):
                 except Exception:
                     pass
 
-    def _image_src_fields(self, headers: list[str]) -> list[str]:
-        out: list[str] = []
-        for h in headers:
-            if re.match(r"^images\.\d+\.src$", h):
-                out.append(h)
-            elif "image" in h.lower() and h.lower().endswith(".src"):
-                out.append(h)
-        return out
+    def _selectable_fields(self, headers: list[str]) -> list[str]:
+        blocked = {"id", "variants.0.id"}
+        return [h for h in headers if h.strip() and h not in blocked]
+
+    def _required_image_dependency_fields(self, selected_fields: list[str]) -> set[str]:
+        deps = {"id"}
+        if any(f.startswith("variants.") for f in selected_fields):
+            deps.add("variants.0.id")
+        return deps
 
     def _sync_sku_mode(self) -> None:
-        if self._sku_all.get():
-            self._sku_combo.configure(state="disabled")
-        else:
+        mode = self._sku_mode.get()
+        if mode == "single":
             self._sku_combo.configure(state="readonly")
+            self._sku_group_entry.configure(state="disabled")
+        elif mode == "group":
+            self._sku_combo.configure(state="disabled")
+            self._sku_group_entry.configure(state="normal")
+        else:
+            self._sku_combo.configure(state="disabled")
+            self._sku_group_entry.configure(state="disabled")
         self._highlight_selected_sku_row()
 
     def _on_sku_changed(self) -> None:
@@ -277,6 +377,10 @@ class ImagesUploadTab(ttk.Frame):
     def _on_field_changed(self) -> None:
         self._refresh_folder_list()
 
+    def _clear_all_fields(self) -> None:
+        self._field_pick.set("")
+        self._on_field_changed()
+
     def _refresh_sku_candidates(self, headers: list[str], data_rows: list[tuple]) -> None:
         sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
         if sku_idx < 0:
@@ -298,10 +402,22 @@ class ImagesUploadTab(ttk.Frame):
             self._sku_pick.set(skus[0])
 
     def _selected_sku(self) -> str | None:
-        if self._sku_all.get():
+        if self._sku_mode.get() != "single":
             return None
         sku = self._sku_pick.get().strip()
         return sku or None
+
+    def _selected_sku_set(self) -> set[str] | None:
+        mode = self._sku_mode.get()
+        if mode == "all":
+            return None
+        if mode == "single":
+            one = self._sku_pick.get().strip()
+            return {one} if one else set()
+        raw = self._sku_group.get()
+        parts = re.split(r"[,\n\r\t]+", raw)
+        out = {p.strip() for p in parts if p.strip()}
+        return out
 
     def _refresh_fields(self) -> None:
         try:
@@ -310,32 +426,32 @@ class ImagesUploadTab(ttk.Frame):
             self._log(f"Field refresh error: {exc}")
             return
         self._headers = headers
-        fields = self._image_src_fields(headers)
+        fields = self._selectable_fields(headers)
 
-        # Rebuild field checkboxes — preserve previous checked state
-        prev_checked = {f for f, v in self._field_vars.items() if v.get()}
+        prev_selected = self._field_pick.get().strip()
         for w in self._field_frame.winfo_children():
             w.destroy()
-        self._field_vars.clear()
         if fields:
-            for f in fields:
-                var = tk.BooleanVar(value=(f in prev_checked) if prev_checked else True)
-                self._field_vars[f] = var
-                ttk.Checkbutton(
-                    self._field_frame, text=f, variable=var,
+            if prev_selected in fields:
+                self._field_pick.set(prev_selected)
+            elif not self._field_pick.get().strip():
+                self._field_pick.set(fields[0])
+            for idx, f in enumerate(fields):
+                ttk.Radiobutton(
+                    self._field_frame, text=f, value=f, variable=self._field_pick,
                     command=self._on_field_changed,
-                ).pack(side=tk.LEFT, padx=(0, 8))
+                ).grid(row=idx // 2, column=idx % 2, sticky=tk.W, padx=(0, 18), pady=2)
         else:
-            ttk.Label(self._field_frame, text="No image fields found in DB", foreground="#888").pack(side=tk.LEFT)
+            ttk.Label(self._field_frame, text="No image fields found in DB", foreground="#888").grid(row=0, column=0, sticky=tk.W)
+            self._field_pick.set("")
 
         self._refresh_sku_candidates(headers, data_rows)
         self._refresh_folder_list()
 
     def _selected_image_fields(self, headers: list[str]) -> list[str]:
-        all_fields = self._image_src_fields(headers)
-        if self._field_vars:
-            return [f for f in all_fields if self._field_vars.get(f) and self._field_vars[f].get()]
-        return all_fields
+        all_fields = self._selectable_fields(headers)
+        selected = self._field_pick.get().strip()
+        return [selected] if selected in all_fields else []
 
     def _row_image_urls(self, row: tuple, headers: list[str], src_fields: list[str]) -> list[str]:
         urls: list[str] = []
@@ -430,9 +546,13 @@ class ImagesUploadTab(ttk.Frame):
             self._app.start_prog("indeterminate")
             self._log("Starting image download from DB fields…")
             ok_count = fail_count = skip_count = 0
+            new_count = 0
+            replaced_count = 0
+            skipped_existing_count = 0
             manifest_lines: list[str] = []
 
             try:
+                self._log_step(1, "Load database", DATABASE_FILE)
                 headers, data_rows = self._load_db()
                 if not headers:
                     self._log("Database is empty.")
@@ -444,12 +564,21 @@ class ImagesUploadTab(ttk.Frame):
                 if not src_fields:
                     self._log("No image src fields selected/found.")
                     return
+                self._log_step(2, "Resolve image fields", f"selected={', '.join(src_fields)}")
+                deps = self._required_image_dependency_fields(src_fields)
+                if "id" in deps and id_idx < 0:
+                    self._log("Missing required column: id")
+                    return
 
-                selected_sku = self._selected_sku()
-                if selected_sku:
-                    self._log(f"Download scope: SKU '{selected_sku}'")
-                else:
+                selected_skus = self._selected_sku_set()
+                if selected_skus is None:
                     self._log("Download scope: ALL SKU")
+                elif len(selected_skus) == 1:
+                    only = next(iter(selected_skus))
+                    self._log(f"Download scope: SINGLE SKU '{only}'")
+                else:
+                    self._log(f"Download scope: GROUP SKU ({len(selected_skus)} item(s))")
+                self._log_step(3, "Filter rows by scope")
 
                 field_indices = [headers.index(f) for f in src_fields]
                 rows_to_process = []
@@ -457,7 +586,8 @@ class ImagesUploadTab(ttk.Frame):
                     sku_val = ""
                     if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, ""):
                         sku_val = str(row[sku_idx]).strip()
-                    if selected_sku and sku_val != selected_sku:
+                    sku_cmp = sku_val or DEFAULT_SKU
+                    if selected_skus is not None and sku_cmp not in selected_skus:
                         continue
                     rows_to_process.append(row)
 
@@ -465,22 +595,28 @@ class ImagesUploadTab(ttk.Frame):
                 if total == 0:
                     self._log("No rows matched selected SKU scope.")
                     return
+                self._log_step(4, "Rows ready", f"matched_rows={total}")
                 self._prog.configure(maximum=max(total, 1), value=0)
                 self._app.start_prog("determinate")
 
                 root_folder = Path(IMAGE_DIR)
                 root_folder.mkdir(exist_ok=True)
+                self._log_step(5, "Prepare target folders", str(root_folder.resolve()))
 
-                target_field = src_fields[0]
-                target_folder = root_folder / self._field_folder_name(target_field)
-                target_folder.mkdir(parents=True, exist_ok=True)
-                existing_files = [p for p in target_folder.iterdir() if p.is_file()]
+                target_folders = []
+                existing_files: list[Path] = []
+                for field_name in src_fields:
+                    target_folder = root_folder / self._field_folder_name(field_name)
+                    target_folder.mkdir(parents=True, exist_ok=True)
+                    target_folders.append(target_folder)
+                    existing_files.extend([p for p in target_folder.iterdir() if p.is_file()])
+                replace_mode = "all"
                 if existing_files:
                     choice = messagebox.askyesnocancel(
                         "Existing Downloaded Images",
-                        f"Folder already has {len(existing_files)} file(s):\n{target_folder.resolve()}\n\n"
-                        "Yes = Replace existing files while downloading\n"
-                        "No = Delete existing files first, then download\n"
+                        f"Selected field folder(s) already have {len(existing_files)} file(s).\n\n"
+                        "Yes = All Replace (replace all duplicated files)\n"
+                        "No = Single Replace (ask one-by-one for duplicates)\n"
                         "Cancel = Abort",
                         parent=self,
                     )
@@ -488,16 +624,11 @@ class ImagesUploadTab(ttk.Frame):
                         self._log("Download cancelled by user (existing files prompt).")
                         return
                     if choice is False:
-                        removed = 0
-                        for p in existing_files:
-                            try:
-                                p.unlink(missing_ok=True)
-                                removed += 1
-                            except Exception:
-                                pass
-                        self._log(f"Deleted {removed} existing file(s) in target folder before download.")
+                        replace_mode = "single"
+                        self._log("Duplicate handling: Single Replace mode (confirm each duplicate file).")
                     else:
-                        self._log("Existing files will be replaced if names match.")
+                        replace_mode = "all"
+                        self._log("Duplicate handling: All Replace mode.")
 
                 for i, row in enumerate(rows_to_process, start=1):
                     product_id = ""
@@ -531,8 +662,22 @@ class ImagesUploadTab(ttk.Frame):
                             field_folder = root_folder / self._field_folder_name(field_name)
                             field_folder.mkdir(parents=True, exist_ok=True)
                             suffix = self._field_suffix(field_name)
-                            file_name = f"{safe_sku}_{suffix}{ext}"
+                            file_name = f"{safe_sku}{ext}"
                             target = field_folder / file_name
+                            if target.exists():
+                                if replace_mode == "single":
+                                    replace_one = messagebox.askyesno(
+                                        "Replace Existing Image",
+                                        f"File already exists:\n{target.name}\n\nReplace this file?",
+                                        parent=self,
+                                    )
+                                    if not replace_one:
+                                        skipped_existing_count += 1
+                                        skip_count += 1
+                                        continue
+                                replaced_count += 1
+                            else:
+                                new_count += 1
                             file_name = str(target.relative_to(root_folder)).replace("\\", "/")
                             resp = requests.get(url, timeout=30)
                             resp.raise_for_status()
@@ -550,12 +695,29 @@ class ImagesUploadTab(ttk.Frame):
                         f"Row {i}/{total}  DOWN_OK:{ok_count}  DOWN_FAIL:{fail_count}  SKIP:{skip_count}"
                     )
 
+                self._log_step(6, "Write manifest and finalize")
                 manifest = self._write_manifest(manifest_lines)
                 self._log(f"Manifest written: {manifest}")
                 self._log(f"Download done. OK:{ok_count} FAIL:{fail_count} SKIP:{skip_count}")
+                self._log(
+                    f"File stats: NEW:{new_count} REPLACED:{replaced_count} SKIPPED_EXISTING:{skipped_existing_count}"
+                )
                 self._app.set_status("Images download completed")
                 self._scan_folder_coverage()
                 self._refresh_folder_list()
+                self._ui_async(
+                    lambda: messagebox.showinfo(
+                        "Images Download Complete",
+                        "Done!\n\n"
+                        f"OK: {ok_count}\n"
+                        f"FAIL: {fail_count}\n"
+                        f"SKIP: {skip_count}\n"
+                        f"NEW: {new_count}\n"
+                        f"REPLACED: {replaced_count}\n"
+                        f"SKIPPED EXISTING: {skipped_existing_count}",
+                        parent=self,
+                    )
+                )
             except Exception as exc:
                 self._log(f"ERROR: {exc}")
                 self._app.set_status("Images download failed")
@@ -583,25 +745,31 @@ class ImagesUploadTab(ttk.Frame):
         id_idx = headers.index("id") if "id" in headers else -1
         sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
         src_fields = self._selected_image_fields(headers)
+        deps = self._required_image_dependency_fields(src_fields)
+        if "id" in deps and id_idx < 0:
+            self._stats.set("Coverage scan requires id column")
+            self._log("Coverage scan error: missing required column 'id'")
+            return
         src_idx = [headers.index(f) for f in src_fields]
 
         has_count = 0
-        miss_count = 0
         for i, row in enumerate(data_rows, start=1):
             product_id = str(row[id_idx]).strip() if id_idx >= 0 and id_idx < len(row) and row[id_idx] not in (None, "") else ""
             sku = str(row[sku_idx]).strip() if sku_idx >= 0 and sku_idx < len(row) and row[sku_idx] not in (None, "") else DEFAULT_SKU
-            files = self._sku_files_for_field(sku, src_fields[0]) if src_fields else []
+            files: list[Path] = []
+            for field_name in src_fields:
+                files.extend(self._sku_files_for_field(sku, field_name))
             url_count = 0
             for fi in src_idx:
                 if fi < len(row) and row[fi] not in (None, ""):
                     u = str(row[fi]).strip().lower()
                     if u.startswith("http://") or u.startswith("https://"):
                         url_count += 1
-            status = "HAS" if files else "MISSING"
-            if files:
-                has_count += 1
-            else:
-                miss_count += 1
+            if not files:
+                continue
+
+            status = "HAS"
+            has_count += 1
             self._tree.insert(
                 "",
                 tk.END,
@@ -609,8 +777,8 @@ class ImagesUploadTab(ttk.Frame):
                 values=(product_id, sku, status, str(len(files)), str(url_count)),
             )
 
-        self._stats.set(f"Coverage: HAS {has_count} | MISSING {miss_count} | Rows {len(data_rows)}")
-        self._log(f"Coverage scan done: HAS {has_count}, MISSING {miss_count}, rows {len(data_rows)}")
+        self._stats.set(f"Coverage: HAS {has_count} | Rows scanned {len(data_rows)}")
+        self._log(f"Coverage scan done: HAS {has_count}, rows scanned {len(data_rows)}")
         self._highlight_selected_sku_row()
         self._refresh_folder_list()
 
@@ -671,27 +839,32 @@ class ImagesUploadTab(ttk.Frame):
         ):
             return
 
+        logger.info("[ImagesTab] Upload button confirmed by user")
         self._running = True
 
         def task():
-            self._app.start_prog("indeterminate")
+            started_at = time.perf_counter()
+            self._ui_async(lambda: self._app.start_prog("indeterminate", use_busy_cursor=False))
             self._log("Starting images upload by SKU…")
             ok_count = fail_count = skip_count = 0
             wb = None
 
             try:
+                self._log_step(1, "Load database", DATABASE_FILE)
+                logger.info("[ImagesTab] Step1 load database start")
                 wb = openpyxl.load_workbook(db, read_only=True, data_only=True)
                 ws = wb.active
                 rows = list(ws.iter_rows(values_only=True))
                 if not rows:
                     self._log("Database is empty.")
                     return
+                logger.info(f"[ImagesTab] Step1 load database done: rows={len(rows) - 1}")
 
                 headers = [str(h or "").strip() for h in rows[0]]
                 data_rows = rows[1:]
                 total = len(data_rows)
-                self._prog.configure(maximum=max(total, 1), value=0)
-                self._app.start_prog("determinate")
+                self._ui_set_upload_progress(0, total, ok_count, fail_count, skip_count)
+                self._ui_async(lambda: self._app.start_prog("determinate", use_busy_cursor=False))
 
                 if "id" not in headers:
                     self._log("Missing required column: id")
@@ -700,12 +873,60 @@ class ImagesUploadTab(ttk.Frame):
                 id_idx = headers.index("id")
                 sku_idx = headers.index("variants.0.sku") if "variants.0.sku" in headers else -1
                 src_fields = self._selected_image_fields(headers)
+                deps = self._required_image_dependency_fields(src_fields)
                 selected_sku = self._selected_sku()
+                if not src_fields:
+                    self._log("Select at least one image field first.")
+                    return
+                self._log_step(2, "Resolve upload fields", f"selected={', '.join(src_fields)}")
+                logger.info(f"[ImagesTab] Step2 selected fields: {src_fields}")
+                if "id" in deps and id_idx < 0:
+                    self._log("Missing required column: id")
+                    return
 
+                self._log_step(3, "Index local image files", IMAGE_DIR)
+                t_index = time.perf_counter()
+                file_index = self._build_field_sku_file_index(src_fields)
+                indexed_file_count = sum(
+                    len(paths)
+                    for sku_map in file_index.values()
+                    for paths in sku_map.values()
+                )
+                self._log(
+                    f"Indexed local images: {indexed_file_count} file(s) across {len(file_index)} selected field folder(s)."
+                )
+                if indexed_file_count == 0:
+                    self._ui_async(
+                        lambda: messagebox.showwarning(
+                            "No Local Images",
+                            "No local image files were found in selected field folder(s).\n"
+                            "Please run image download first or check folder naming.",
+                            parent=self,
+                        )
+                    )
+                logger.info(
+                    "[ImagesTab] Step3 index done: files=%s fields=%s elapsed=%.2fs",
+                    indexed_file_count,
+                    len(file_index),
+                    time.perf_counter() - t_index,
+                )
+                payload_cache: dict[str, list[dict]] = {}
+
+                indexed_skus: set[str] = set()
+                for sku_map in file_index.values():
+                    indexed_skus.update(sku_map.keys())
+
+                # Build upload plan first: only keep rows whose SKU exists in indexed image files.
+                self._log_step(4, "Pre-filter DB rows", "match SKU from indexed image names")
+                t_filter = time.perf_counter()
+                rows_to_upload: list[tuple[int, str, str, str]] = []
+                pre_skip_no_id = 0
+                pre_skip_scope = 0
+                pre_skip_no_match = 0
                 for i, row in enumerate(data_rows, start=1):
                     product_id = str(row[id_idx]).strip() if id_idx < len(row) and row[id_idx] not in (None, "") else ""
                     if not product_id:
-                        skip_count += 1
+                        pre_skip_no_id += 1
                         continue
 
                     sku = ""
@@ -713,12 +934,62 @@ class ImagesUploadTab(ttk.Frame):
                         sku = str(row[sku_idx]).strip()
                     if not sku:
                         sku = DEFAULT_SKU
+
                     if selected_sku and sku != selected_sku:
-                        skip_count += 1
-                        self._prog["value"] = i
+                        pre_skip_scope += 1
                         continue
 
-                    images = self._image_payload_for_sku(sku, src_fields[0] if src_fields else None)
+                    safe_sku = self._safe_sku(sku)
+                    if safe_sku not in indexed_skus:
+                        pre_skip_no_match += 1
+                        continue
+
+                    rows_to_upload.append((i, product_id, sku, safe_sku))
+
+                pre_skipped_total = pre_skip_no_id + pre_skip_scope + pre_skip_no_match
+                if pre_skipped_total:
+                    self._log(
+                        "Pre-filter rows: "
+                        f"skip no id={pre_skip_no_id}, "
+                        f"out of scope={pre_skip_scope}, "
+                        f"no matched image sku={pre_skip_no_match}"
+                    )
+                logger.info(
+                    "[ImagesTab] Step4 pre-filter done: matched=%s skip_no_id=%s skip_scope=%s skip_no_match=%s elapsed=%.2fs",
+                    len(rows_to_upload),
+                    pre_skip_no_id,
+                    pre_skip_scope,
+                    pre_skip_no_match,
+                    time.perf_counter() - t_filter,
+                )
+
+                total = len(rows_to_upload)
+                if total == 0:
+                    self._log("No rows matched indexed image SKU list. Nothing to upload.")
+                    self._ui_async(lambda: self._app.set_status("Images upload skipped: no matched rows"))
+                    self._ui_async(
+                        lambda: messagebox.showwarning(
+                            "No Matched Rows",
+                            "No rows matched the indexed image SKU list.\n"
+                            "Check selected field, SKU scope, and image filename pattern.",
+                            parent=self,
+                        )
+                    )
+                    return
+                self._log_step(5, "Upload plan ready", f"rows_to_upload={total}")
+                logger.info(f"[ImagesTab] Step5 plan ready: total={total}")
+
+                self._ui_set_upload_progress(0, total, ok_count, fail_count, skip_count)
+                self._ui_async(lambda: self._app.start_prog("determinate", use_busy_cursor=False))
+
+                self._log_step(6, "Upload images to Shopify")
+                logger.info("[ImagesTab] Step6 upload loop start")
+                for done_idx, (_sheet_row, product_id, sku, safe_sku) in enumerate(rows_to_upload, start=1):
+                    if safe_sku in payload_cache:
+                        images = payload_cache[safe_sku]
+                    else:
+                        images = self._image_payload_from_index(safe_sku, src_fields, file_index)
+                        payload_cache[safe_sku] = images
 
                     if not images:
                         skip_count += 1
@@ -737,19 +1008,25 @@ class ImagesUploadTab(ttk.Frame):
                             fail_count += 1
                             self._log(f"FAIL ID {product_id}: {code} {err}")
 
-                    self._prog["value"] = i
-                    self._stats.set(
-                        f"Row {i}/{total}  OK:{ok_count}  FAIL:{fail_count}  SKIP:{skip_count}"
-                    )
-                    time.sleep(0.35)
+                    self._ui_set_upload_progress(done_idx, total, ok_count, fail_count, skip_count)
+                    # Keep a tiny pacing gap to reduce burst throttling without slowing throughput too much.
+                    time.sleep(0.05)
 
                 self._log(f"Done. OK:{ok_count} FAIL:{fail_count} SKIP:{skip_count}")
-                self._app.set_status("Images upload completed")
-                self._scan_folder_coverage()
+                logger.info(
+                    "[ImagesTab] Upload finished: ok=%s fail=%s skip=%s elapsed=%.2fs",
+                    ok_count,
+                    fail_count,
+                    skip_count,
+                    time.perf_counter() - started_at,
+                )
+                self._ui_async(lambda: self._app.set_status("Images upload completed"))
+                self._ui_async(self._scan_folder_coverage)
             except Exception as exc:
+                logger.exception("[ImagesTab] Upload task crashed")
                 self._log(f"ERROR: {exc}")
-                self._app.set_status("Images upload failed")
-                messagebox.showerror("Images Upload Error", str(exc), parent=self)
+                self._ui_async(lambda: self._app.set_status("Images upload failed"))
+                self._ui_async(lambda: messagebox.showerror("Images Upload Error", str(exc), parent=self))
             finally:
                 if wb is not None:
                     try:
@@ -757,6 +1034,6 @@ class ImagesUploadTab(ttk.Frame):
                     except Exception:
                         pass
                 self._running = False
-                self._app.stop_prog()
+                self._ui_async(lambda: self._app.stop_prog(clear_busy_cursor=False))
 
         threading.Thread(target=task, daemon=True).start()

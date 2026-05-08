@@ -31,6 +31,7 @@ class UploadTab(ttk.Frame):
         self._upload_headers: list[str] = []
         self._upload_cols_file_sig: tuple[int, int] | None = None
         self._upload_cols_poll_job: str | None = None
+        self._upload_cols_lock_warn_at: float = 0.0
         self._safe_delay = tk.DoubleVar(value=0.3)
         self._pause_event = threading.Event()
         self._stop_event = threading.Event()
@@ -324,6 +325,16 @@ class UploadTab(ttk.Frame):
             if not rows:
                 return
             headers = [str(h or "").strip() for h in rows[0]]
+        except PermissionError:
+            now = time.time()
+            # Avoid repeating the same lock warning too often during auto-refresh polling.
+            if (now - self._upload_cols_lock_warn_at) >= 10:
+                self._upload_cols_lock_warn_at = now
+                self._log(
+                    "Upload columns cannot be read: Excel file is locked/open in another app. "
+                    "Please close Shopify_database_264.xlsx, then click 'Load Columns'."
+                )
+            return
         except Exception as exc:
             self._log(f"Upload columns load error: {exc}")
             return
@@ -936,6 +947,7 @@ class UploadTab(ttk.Frame):
                                 continue
 
                             request_payload = {"product": prod}
+                            request_payload_text = self._payload_log_text(request_payload)
 
                             # Detect what will actually be sent to determine request count.
                             _p_keys = {k for k in prod if k not in {"id", "variants", "images", "metafields"} and prod[k] not in (None, "")}
@@ -954,7 +966,7 @@ class UploadTab(ttk.Frame):
                             _mode_label = "+".join(_mode_parts) if _mode_parts else "?"
                             _req_est = len(_mode_parts)  # rough est: 1 call per resource type
                             self._log(
-                                f"Row {idx + 2}  ID {product_id}: [{_mode_label}] ~{_req_est} req -> {self._payload_log_text(request_payload)}"
+                                f"Row {idx + 2}  ID {product_id}: [{_mode_label}] ~{_req_est} req -> {request_payload_text}"
                             )
                             row_api_stats: dict[str, int] = {}
                             fut = pool.submit(
@@ -967,7 +979,7 @@ class UploadTab(ttk.Frame):
                                 row_api_stats,
                                 on_backoff,
                             )
-                            in_flight[fut] = (idx, str(product_id), time.perf_counter(), row_api_stats)
+                            in_flight[fut] = (idx, str(product_id), time.perf_counter(), row_api_stats, request_payload_text)
                             sent_count += 1
                             set_stats(idx + 2)
 
@@ -986,7 +998,7 @@ class UploadTab(ttk.Frame):
 
                         done, _ = wait(list(in_flight.keys()), timeout=0.2, return_when=FIRST_COMPLETED)
                         for fut in done:
-                            idx, product_id, row_started, row_api_stats = in_flight.pop(fut)
+                            idx, product_id, row_started, row_api_stats, request_payload_text = in_flight.pop(fut)
                             row_reqs = int(row_api_stats.get("requests", 0))
                             req_count += row_reqs
                             last_sku_secs = max(0.0, time.perf_counter() - row_started)
@@ -1019,6 +1031,9 @@ class UploadTab(ttk.Frame):
                                     f"  |  req: {row_reqs}"
                                     f"  |  {per_req_secs:.2f}s/req"
                                     f"  |  {last_sku_secs:.2f}s/sku"
+                                )
+                                self._log(
+                                    f"Row {idx + 2}  ID {product_id}: FAIL request JSON -> {request_payload_text}"
                                 )
 
                             mark_done(idx)
@@ -1083,6 +1098,9 @@ class UploadTab(ttk.Frame):
     def _clear_session(self) -> None:
         if self._app.confirm_danger("Clear Session", "Clear the saved upload session?"):
             clear_session()
+            self._log_box.config(state="normal")
+            self._log_box.delete("1.0", tk.END)
+            self._log_box.config(state="disabled")
             self._cont_btn.config(state="disabled")
             self._stats.set("")
             self._stats_label.config(foreground="#333")

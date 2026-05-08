@@ -12,7 +12,7 @@ This file helps coding agents work faster and safer in this repository.
 - `shopify_erp/ui/app.py`: Global app shell, notebook tabs, shared progress/status.
 - `shopify_erp/ui/tab_download.py`: Product download to Excel.
 - `shopify_erp/ui/tab_upload.py`: Product upload from Excel.
-- `shopify_erp/ui/tab_images_upload.py`: Image download/upload tools.
+- `shopify_erp/ui/tab_images_download.py`: Image download tools.
 
 ## Expected Workflow For Code Changes
 1. Read only the files directly related to the request.

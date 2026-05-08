@@ -16,7 +16,7 @@ This repository is a Python desktop app for Shopify operations (Tkinter UI).
 ## Important App Flows
 - Download products: `shopify_erp/ui/tab_download.py`
 - Upload products: `shopify_erp/ui/tab_upload.py`
-- Image workflows: `shopify_erp/ui/tab_images_upload.py`
+- Image workflows: `shopify_erp/ui/tab_images_download.py`
 - Shared app shell/status/progress: `shopify_erp/ui/app.py`
 
 ## Working Rules
