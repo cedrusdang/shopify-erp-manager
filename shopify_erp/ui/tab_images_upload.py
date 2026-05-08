@@ -17,7 +17,6 @@ from tkinter import ttk, messagebox
 import openpyxl
 import requests
 
-from ..api import update_product_api, test_connection
 from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR
 
 logger = logging.getLogger(__name__)
@@ -198,7 +197,7 @@ class ImagesUploadTab(ttk.Frame):
             self._sku_group_entry.config(state="disabled")
 
     def _image_root_dir(self) -> str:
-        """Alias for _initial_image_folder for backward compatibility."""
+        """Deprecated: use _initial_image_folder() instead."""
         return self._initial_image_folder()
 
     def _suffix_history_path(self) -> Path:
@@ -292,10 +291,8 @@ class ImagesUploadTab(ttk.Frame):
     def _select_folder(self) -> None:
         current = self._selected_folder.get().strip()
         initial = current if current and Path(current).is_dir() else self._initial_image_folder()
-        self._log(f"[DEBUG] Browse dialog initialdir: {initial}")
         folder = filedialog.askdirectory(title="Select Image Folder", initialdir=initial)
         if folder:
-            self._log(f"[DEBUG] Selected folder: {folder}")
             self._selected_folder.set(folder)
             self._scan_available_images()
 
@@ -303,14 +300,12 @@ class ImagesUploadTab(ttk.Frame):
         folder = self._selected_folder.get().strip()
         if not folder:
             folder = self._initial_image_folder()
-            self._log(f"[DEBUG] No selection, fallback to: {folder}")
         else:
-            self._log(f"[DEBUG] Open folder: {folder}")
+            pass  # Use selected folder
         if not folder:
             messagebox.showwarning("No Folder", "No image folder available.", parent=self)
             return
         if not Path(folder).is_dir():
-            self._log(f"[DEBUG] Folder does not exist: {folder}")
             messagebox.showerror("Invalid Folder", f"Folder not found: {folder}", parent=self)
             return
         try:
