@@ -300,8 +300,6 @@ class ImagesUploadTab(ttk.Frame):
         folder = self._selected_folder.get().strip()
         if not folder:
             folder = self._initial_image_folder()
-        else:
-            pass  # Use selected folder
         if not folder:
             messagebox.showwarning("No Folder", "No image folder available.", parent=self)
             return
@@ -566,6 +564,12 @@ class ImagesUploadTab(ttk.Frame):
 
                 for img_path in sku_images:
                     try:
+                        # Validate file is readable
+                        if not img_path.is_file() or not img_path.stat().st_size:
+                            fail_count += 1
+                            self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ (not readable or empty)")
+                            continue
+                        
                         # Read and encode image
                         with open(img_path, "rb") as f:
                             img_data = f.read()
