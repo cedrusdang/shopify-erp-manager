@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from tkinter import scrolledtext, filedialog
 import tkinter as tk
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Common image extensions
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+SUFFIX_HISTORY_FILE = "image_suffix_history.json"
 
 
 class ImagesUploadTab(ttk.Frame):
@@ -32,10 +35,19 @@ class ImagesUploadTab(ttk.Frame):
         self._app = app
         self._running = False
         self._headers: list[str] = []
+        self._field_pick = tk.StringVar(value="")
         self._sku_mode = tk.StringVar(value="all")
-        self._selected_folder = tk.StringVar(value="")
+        self._selected_folder = tk.StringVar(value=self._initial_image_folder())
         self._image_suffix = tk.StringVar(value="")
+        self._suffix_hint = tk.StringVar(value="")
+        self._suffix_history = self._load_suffix_history()
         self._build()
+
+    def _initial_image_folder(self) -> str:
+        root = Path(IMAGE_DIR)
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        return str(root.resolve())
 
     def _build(self) -> None:
         ttk.Label(
@@ -72,13 +84,21 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Entry(folder_row, textvariable=self._selected_folder, state="readonly").pack(side=tk.LEFT, padx=(6, 6), fill=tk.X, expand=True)
         ttk.Button(folder_row, text="Browse...", command=self._select_folder).pack(side=tk.LEFT)
 
+        # Field selection
+        field_row = ttk.Frame(options)
+        field_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(field_row, text="Target Field:").pack(side=tk.LEFT)
+        self._field_combo = ttk.Combobox(field_row, textvariable=self._field_pick, state="readonly", width=42)
+        self._field_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self._field_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_field_changed())
+
         # Image suffix
         suffix_row = ttk.Frame(options)
         suffix_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(suffix_row, text="Image Suffix Pattern:").pack(side=tk.LEFT)
         self._suffix_entry = ttk.Entry(suffix_row, textvariable=self._image_suffix)
         self._suffix_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
-        ttk.Label(suffix_row, text="e.g. _main, _alt1, etc.", foreground="#999", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(suffix_row, textvariable=self._suffix_hint, foreground="#999", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 0))
 
         # SKU scope
         sku_row = ttk.Frame(options)
@@ -149,6 +169,7 @@ class ImagesUploadTab(ttk.Frame):
         self._log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         self._sync_sku_mode()
+        self._load_field_options()
         self._load_skus_from_db()
 
     def _log(self, msg: str) -> None:
@@ -176,8 +197,104 @@ class ImagesUploadTab(ttk.Frame):
             self._sku_combo.config(state="disabled")
             self._sku_group_entry.config(state="disabled")
 
+    def _image_root_dir(self) -> str:
+        root = Path(IMAGE_DIR)
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        return str(root.resolve())
+
+    def _suffix_history_path(self) -> Path:
+        return Path.cwd() / SUFFIX_HISTORY_FILE
+
+    def _load_suffix_history(self) -> dict[str, dict]:
+        path = self._suffix_history_path()
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to read suffix history")
+            return {}
+
+    def _save_suffix_history(self) -> None:
+        path = self._suffix_history_path()
+        try:
+            path.write_text(json.dumps(self._suffix_history, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to save suffix history")
+
+    def _guess_suffix_from_field(self, field_name: str) -> str:
+        raw = (field_name or "").strip().split(".")[-1]
+        clean = re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
+        return f"_{clean}" if clean else "_img"
+
+    def _image_fields_from_headers(self, headers: list[str]) -> list[str]:
+        fields: list[str] = []
+        for h in headers:
+            key = (h or "").strip()
+            if not key:
+                continue
+            k = key.lower()
+            if k in {"id", "variants.0.id", "variants.0.sku", "sku"}:
+                continue
+            if ".src" in k or "image" in k or "img" in k:
+                fields.append(key)
+        return fields
+
+    def _load_field_options(self) -> None:
+        try:
+            wb = openpyxl.load_workbook(DATABASE_FILE, read_only=True, data_only=True)
+            ws = wb.active
+            rows = ws.iter_rows(min_row=1, max_row=1, values_only=True)
+            first = next(rows, None)
+            headers = [str(h or "").strip() for h in (first or [])]
+            wb.close()
+        except Exception as exc:
+            logger.exception("Failed to load fields from DB")
+            self._log(f"Error loading fields: {exc}")
+            return
+
+        fields = self._image_fields_from_headers(headers)
+        self._field_combo["values"] = fields
+        if fields and not self._field_pick.get().strip():
+            self._field_pick.set(fields[0])
+        self._on_field_changed()
+
+    def _on_field_changed(self) -> None:
+        field_name = self._field_pick.get().strip()
+        if not field_name:
+            self._suffix_hint.set("e.g. _main, _alt1, etc.")
+            return
+
+        suggested = self._guess_suffix_from_field(field_name)
+        self._suffix_hint.set(f"suggestion: {suggested} (field: {field_name})")
+
+        hist = self._suffix_history.get(field_name, {})
+        prev_suffix = str(hist.get("suffix", "")).strip()
+
+        if prev_suffix:
+            if self._image_suffix.get().strip() != prev_suffix:
+                use_prev = messagebox.askyesno(
+                    "Reuse Previous Suffix",
+                    f"Field: {field_name}\nPrevious suffix: {prev_suffix}\n\nUse this suffix?",
+                    parent=self,
+                )
+                if use_prev:
+                    self._image_suffix.set(prev_suffix)
+        elif not self._image_suffix.get().strip():
+            self._image_suffix.set(suggested)
+
+    def _remember_suffix(self, field_name: str, suffix: str) -> None:
+        self._suffix_history[field_name] = {
+            "suffix": suffix,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save_suffix_history()
+
     def _select_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Select Image Folder")
+        current = self._selected_folder.get().strip()
+        initial = current if current and Path(current).is_dir() else self._image_root_dir()
+        folder = filedialog.askdirectory(title="Select Image Folder", initialdir=initial)
         if folder:
             self._selected_folder.set(folder)
             self._scan_available_images()
@@ -185,7 +302,12 @@ class ImagesUploadTab(ttk.Frame):
     def _open_selected_folder(self) -> None:
         folder = self._selected_folder.get().strip()
         if not folder:
-            messagebox.showwarning("No Folder", "Please select an image folder first.", parent=self)
+            folder = self._initial_image_folder()
+        if not folder:
+            messagebox.showwarning("No Folder", "No image folder available.", parent=self)
+            return
+        if not Path(folder).is_dir():
+            messagebox.showerror("Invalid Folder", f"Folder not found: {folder}", parent=self)
             return
         try:
             import subprocess
@@ -202,29 +324,53 @@ class ImagesUploadTab(ttk.Frame):
 
     def _load_skus_from_db(self) -> None:
         """Load SKU list from database for single SKU selector."""
+        wb = None
         try:
             wb = openpyxl.load_workbook(DATABASE_FILE, data_only=True)
             ws = wb.active
+            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            headers = [str(h or "").strip() for h in (header_row or [])]
+            sku_idx = self._find_col_idx(headers, {"variants.0.sku", "sku"})
+            if sku_idx is None:
+                self._log("SKU column not found in database headers.")
+                self._sku_combo["values"] = []
+                return
+
             skus = []
             for row in ws.iter_rows(min_row=2, values_only=True):
-                sku = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                sku = str(row[sku_idx]).strip() if len(row) > sku_idx and row[sku_idx] else ""
                 if sku and sku != DEFAULT_SKU:
                     skus.append(sku)
             self._sku_combo["values"] = skus
-            wb.close()
         except Exception as e:
             logger.exception("Failed to load SKUs from DB")
             self._log(f"Error loading SKUs: {e}")
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+
+    def _find_col_idx(self, headers: list[str], accepted: set[str]) -> int | None:
+        lowered = [h.lower() for h in headers]
+        for name in accepted:
+            key = name.lower()
+            if key in lowered:
+                return lowered.index(key)
+        return None
 
     def _scan_available_images(self) -> None:
         """Scan folder and update tree with available images."""
         folder = self._selected_folder.get().strip()
+        if not folder:
+            folder = self._initial_image_folder()
         suffix = self._image_suffix.get().strip()
 
         self._tree.delete(*self._tree.get_children())
 
         if not folder:
-            self._log("No folder selected.")
+            self._log("No folder available.")
             return
 
         folder_path = Path(folder)
@@ -286,10 +432,15 @@ class ImagesUploadTab(ttk.Frame):
     def _start_upload_images(self) -> None:
         """Start upload process in background thread."""
         folder = self._selected_folder.get().strip()
+        field_name = self._field_pick.get().strip()
         suffix = self._image_suffix.get().strip()
 
         if not folder:
             messagebox.showwarning("No Folder", "Please select an image folder.", parent=self)
+            return
+
+        if not field_name:
+            messagebox.showwarning("No Field", "Please select target field first.", parent=self)
             return
 
         if not Path(folder).is_dir():
@@ -303,9 +454,19 @@ class ImagesUploadTab(ttk.Frame):
         # Confirm upload start
         sku_set = self._selected_sku_set()
         scope_desc = f"({len(sku_set)} SKUs)" if sku_set else "(all SKUs)"
-        msg = f"Upload images from:\n{folder}\n\nSuffix: {suffix if suffix else '(none)'}\nScope: {scope_desc}\n\nProceed?"
+        sample_name = f"SAMPLESKU{suffix}.jpg" if suffix else "SAMPLESKU.jpg"
+        msg = (
+            f"Upload images from:\n{folder}\n\n"
+            f"Field: {field_name}\n"
+            f"Suffix: {suffix if suffix else '(none)'}\n"
+            f"Filename format: {sample_name}\n"
+            f"Scope: {scope_desc}\n\n"
+            "Is this correct?"
+        )
         if not self._app.confirm("Confirm Image Upload", msg):
             return
+
+        self._remember_suffix(field_name, suffix)
 
         self._running = True
         self._app.start_prog("determinate", use_busy_cursor=False)
@@ -327,6 +488,7 @@ class ImagesUploadTab(ttk.Frame):
     def _run_upload_task(self, store: str, token: str, folder: str, suffix: str, sku_set: set[str]) -> None:
         """Execute the upload task."""
         start_time = time.time()
+        wb = None
 
         try:
             # Load database to get SKU->ID mapping
@@ -334,15 +496,21 @@ class ImagesUploadTab(ttk.Frame):
             wb = openpyxl.load_workbook(DATABASE_FILE, data_only=True)
             ws = wb.active
 
+            header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            headers = [str(h or "").strip() for h in (header_row or [])]
+            id_idx = self._find_col_idx(headers, {"id"})
+            sku_idx = self._find_col_idx(headers, {"variants.0.sku", "sku"})
+            if id_idx is None or sku_idx is None:
+                raise RuntimeError("Database must contain 'id' and 'variants.0.sku' (or 'sku') columns.")
+
             sku_to_id = {}
             for row in ws.iter_rows(min_row=2, values_only=True):
-                if len(row) < 2:
+                if len(row) <= max(id_idx, sku_idx):
                     continue
-                prod_id = str(row[0]).strip() if row[0] else ""
-                sku = str(row[1]).strip() if row[1] else ""
+                prod_id = str(row[id_idx]).strip() if row[id_idx] else ""
+                sku = str(row[sku_idx]).strip() if row[sku_idx] else ""
                 if prod_id and sku and sku != DEFAULT_SKU:
                     sku_to_id[sku] = prod_id
-            wb.close()
             self._log(f"Loaded {len(sku_to_id)} SKU→ID mappings from database")
 
             # Scan folder for images
@@ -439,7 +607,7 @@ class ImagesUploadTab(ttk.Frame):
             # Done
             elapsed = time.time() - start_time
             self._log_step(4, f"Upload completed in {elapsed:.1f}s (ok={ok_count}, fail={fail_count}, skip={skip_count})")
-            self._stats.set(f"Uploaded: {ok_count} images | Failed: {fail_count} | Skipped: {skip_count}")
+            self._ui_async(lambda: self._stats.set(f"Uploaded: {ok_count} images | Failed: {fail_count} | Skipped: {skip_count}"))
 
             self._ui_async(lambda: self._app.stop_prog(clear_busy_cursor=False))
             self._ui_async(
@@ -454,6 +622,12 @@ class ImagesUploadTab(ttk.Frame):
             logger.exception("Upload task failed")
             self._ui_async(lambda: self._app.stop_prog(clear_busy_cursor=False))
             raise
+        finally:
+            if wb is not None:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
 
     def _log_step(self, step_no: int, title: str, detail: str = "") -> None:
         if detail:

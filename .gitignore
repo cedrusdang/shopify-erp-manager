@@ -27,6 +27,7 @@ ENV/
 # App runtime files
 credentials.txt
 upload_session.json
+image_suffix_history.json
 download_field_state.json
 backups/
 Shopify_database_264.xlsx
