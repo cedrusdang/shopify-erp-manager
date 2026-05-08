@@ -121,8 +121,9 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Label(
             options,
             text=(
-                "Note: any header can be selected here. This tab currently writes only to "
-                "metafields.*, variants.0.metafields.*, or images.*.src. Metafield targets do not add to product gallery."
+                "Note: UI selection may show many headers, but this upload flow is intended only for "
+                "metafields.custom.xxx, variants.0.metafields.custom.xxx, or images.*.src. "
+                "Metafield targets do not add to product gallery."
             ),
             foreground="#555",
             font=("Segoe UI", 8),
