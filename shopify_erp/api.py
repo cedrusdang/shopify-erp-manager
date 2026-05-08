@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import mimetypes
 import re
 import time
 import logging
+from pathlib import Path
 from typing import Callable
 from urllib.parse import quote, unquote
 
@@ -17,6 +19,7 @@ logger = logging.getLogger(__name__)
 # Fast-path cache for metafield uploads:
 # verify once (first owner/first SKU), then reuse known type/strategy for next rows.
 _METAFIELD_VERIFY_CACHE: dict[tuple[str, str, str], dict[str, str]] = {}
+_METAFIELD_DEFINITION_TYPE_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 # ──────────────────────────────────────────────────────────
@@ -31,6 +34,255 @@ def _headers(token: str) -> dict[str, str]:
 
 def _rest_base_url(store: str) -> str:
     return f"https://{store}/admin/api/{API_VER}"
+
+
+def _graphql_url(store: str) -> str:
+        return f"https://{store}/admin/api/{API_VER}/graphql.json"
+
+
+def _graphql_post(store: str, token: str, query: str, variables: dict | None = None, timeout: int = 45) -> dict:
+        payload: dict[str, object] = {"query": query}
+        if variables is not None:
+                payload["variables"] = variables
+        resp = requests.post(_graphql_url(store), headers=_headers(token), json=payload, timeout=timeout)
+        if not resp.ok:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        body = resp.json() if resp.content else {}
+        errors = body.get("errors", []) if isinstance(body, dict) else []
+        if errors:
+                first = errors[0] if isinstance(errors[0], dict) else {}
+                raise RuntimeError(str(first.get("message", "GraphQL request failed")))
+        return body.get("data", {}) if isinstance(body, dict) else {}
+
+
+def get_metafield_definition_type(store: str, token: str, owner_type: str, namespace: str, key: str) -> str:
+        cache_key = (owner_type, namespace, key)
+        cached = _METAFIELD_DEFINITION_TYPE_CACHE.get(cache_key)
+        if cached is not None:
+                return cached
+
+        query = """
+        query MetafieldDefinitionType($ownerType: MetafieldOwnerType!, $namespace: String!, $key: String!) {
+            metafieldDefinitions(ownerType: $ownerType, namespace: $namespace, key: $key, first: 1) {
+                nodes {
+                    type {
+                        name
+                    }
+                }
+            }
+        }
+        """
+        data = _graphql_post(
+                store,
+                token,
+                query,
+                variables={"ownerType": owner_type, "namespace": namespace, "key": key},
+        )
+        nodes = (((data or {}).get("metafieldDefinitions") or {}).get("nodes") or [])
+        type_name = ""
+        if nodes:
+                first = nodes[0] if isinstance(nodes[0], dict) else {}
+                type_name = str(((first.get("type") or {}).get("name") or "")).strip()
+        _METAFIELD_DEFINITION_TYPE_CACHE[cache_key] = type_name
+        return type_name
+
+
+def _extract_shopify_file_url(file_node: dict) -> str:
+        if not isinstance(file_node, dict):
+                return ""
+        image = file_node.get("image") or {}
+        if isinstance(image, dict):
+                image_url = str(image.get("url", "")).strip()
+                if image_url:
+                        return image_url
+        direct_url = str(file_node.get("url", "")).strip()
+        if direct_url:
+                return direct_url
+        preview = file_node.get("preview") or {}
+        if isinstance(preview, dict):
+                preview_image = preview.get("image") or {}
+                if isinstance(preview_image, dict):
+                        preview_url = str(preview_image.get("url", "")).strip()
+                        if preview_url:
+                                return preview_url
+        return ""
+
+
+def upload_file_to_shopify_files(store: str, token: str, file_path: str | Path, alt: str = "") -> tuple[bool, str, str, str]:
+        path = Path(file_path)
+        if not path.is_file():
+                return False, "", "", f"File not found: {path}"
+
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        content_type = "IMAGE" if mime_type.startswith("image/") else "FILE"
+
+        query_stage = """
+        mutation CreateStagedUpload($input: [StagedUploadInput!]!) {
+            stagedUploadsCreate(input: $input) {
+                stagedTargets {
+                    url
+                    resourceUrl
+                    parameters {
+                        name
+                        value
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+        data_stage = _graphql_post(
+                store,
+                token,
+                query_stage,
+                variables={
+                        "input": [
+                                {
+                                        "filename": path.name,
+                                        "mimeType": mime_type,
+                                        "httpMethod": "POST",
+                                        "resource": content_type,
+                                }
+                        ]
+                },
+                timeout=60,
+        )
+        stage_payload = (data_stage or {}).get("stagedUploadsCreate") or {}
+        stage_errors = stage_payload.get("userErrors") or []
+        if stage_errors:
+                first_error = stage_errors[0] if isinstance(stage_errors[0], dict) else {}
+                return False, "", "", str(first_error.get("message", "stagedUploadsCreate failed"))
+        staged_targets = stage_payload.get("stagedTargets") or []
+        if not staged_targets:
+                return False, "", "", "No staged upload target returned"
+
+        target = staged_targets[0] if isinstance(staged_targets[0], dict) else {}
+        upload_url = str(target.get("url", "")).strip()
+        resource_url = str(target.get("resourceUrl", "")).strip()
+        parameters = target.get("parameters") or []
+        if not upload_url or not resource_url:
+                return False, "", "", "Invalid staged upload target returned"
+
+        form_data: list[tuple[str, str]] = []
+        for item in parameters:
+                if not isinstance(item, dict):
+                        continue
+                name = str(item.get("name", "")).strip()
+                value = str(item.get("value", ""))
+                if name:
+                        form_data.append((name, value))
+
+        with path.open("rb") as fh:
+                resp_upload = requests.post(
+                        upload_url,
+                        data=form_data,
+                        files={"file": (path.name, fh, mime_type)},
+                        timeout=120,
+                )
+        if not resp_upload.ok:
+                return False, "", "", f"HTTP {resp_upload.status_code}: {resp_upload.text[:300]}"
+
+        query_create = """
+        mutation CreateFile($files: [FileCreateInput!]!) {
+            fileCreate(files: $files) {
+                files {
+                    id
+                    fileStatus
+                    preview {
+                        image {
+                            url
+                        }
+                    }
+                    ... on MediaImage {
+                        image {
+                            url
+                        }
+                    }
+                    ... on GenericFile {
+                        url
+                    }
+                }
+                userErrors {
+                    field
+                    message
+                }
+            }
+        }
+        """
+        data_create = _graphql_post(
+                store,
+                token,
+                query_create,
+                variables={
+                        "files": [
+                                {
+                                        "alt": alt,
+                                        "contentType": content_type,
+                                        "originalSource": resource_url,
+                                }
+                        ]
+                },
+                timeout=60,
+        )
+        create_payload = (data_create or {}).get("fileCreate") or {}
+        create_errors = create_payload.get("userErrors") or []
+        if create_errors:
+                first_error = create_errors[0] if isinstance(create_errors[0], dict) else {}
+                return False, "", "", str(first_error.get("message", "fileCreate failed"))
+        files = create_payload.get("files") or []
+        if not files:
+                return False, "", "", "No file returned from fileCreate"
+
+        file_node = files[0] if isinstance(files[0], dict) else {}
+        file_id = str(file_node.get("id", "")).strip()
+        file_status = str(file_node.get("fileStatus", "")).strip().upper()
+        file_url = _extract_shopify_file_url(file_node)
+
+        query_poll = """
+        query ShopifyFileNode($id: ID!) {
+            node(id: $id) {
+                ... on MediaImage {
+                    id
+                    fileStatus
+                    preview {
+                        image {
+                            url
+                        }
+                    }
+                    image {
+                        url
+                    }
+                }
+                ... on GenericFile {
+                    id
+                    fileStatus
+                    preview {
+                        image {
+                            url
+                        }
+                    }
+                    url
+                }
+            }
+        }
+        """
+        for _attempt in range(10):
+                if file_id and file_url and file_status == "READY":
+                        return True, file_id, file_url, ""
+                if not file_id:
+                        break
+                time.sleep(1)
+                data_poll = _graphql_post(store, token, query_poll, variables={"id": file_id}, timeout=45)
+                file_node = (data_poll or {}).get("node") or {}
+                file_status = str(file_node.get("fileStatus", file_status)).strip().upper()
+                file_url = _extract_shopify_file_url(file_node) or file_url
+
+        if file_id and file_url:
+                return True, file_id, file_url, ""
+        return False, file_id, file_url, "Shopify file upload finished without a usable file URL"
 
 
 def _parse_next_page_info(link_header: str) -> str | None:
@@ -843,6 +1095,7 @@ def update_product_api(
         cache_key = (owner_resource, ns, key)
         cached = _METAFIELD_VERIFY_CACHE.get(cache_key)
         inferred_type = _infer_metafield_type(value)
+        owner_type = "PRODUCTVARIANT" if owner_resource == "variant" else "PRODUCT"
 
         # Fast path after first verification: try POST directly.
         if cached:
@@ -901,6 +1154,8 @@ def update_product_api(
             return True, 200, ""
 
         # Create new metafield if not found.
+        definition_type = get_metafield_definition_type(store, token_val, owner_type, ns, key)
+        create_type = definition_type or inferred_type
         _count_request()
         resp_post = requests.post(
             owner_url,
@@ -910,14 +1165,14 @@ def update_product_api(
                     "namespace": ns,
                     "key": key,
                     "value": str(value),
-                    "type": inferred_type,
+                    "type": create_type,
                 }
             },
             timeout=30,
         )
         if not resp_post.ok:
             return False, resp_post.status_code, f"HTTP {resp_post.status_code}: {resp_post.text[:300]}"
-        _METAFIELD_VERIFY_CACHE[cache_key] = {"type": inferred_type}
+        _METAFIELD_VERIFY_CACHE[cache_key] = {"type": create_type}
         return True, 200, ""
 
     wait = 1

@@ -8,7 +8,6 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from tkinter import scrolledtext, filedialog
 import tkinter as tk
@@ -17,13 +16,14 @@ from tkinter import ttk, messagebox
 import openpyxl
 import requests
 
+from ..api import get_metafield_definition_type, update_product_api, upload_file_to_shopify_files
 from ..constants import DATABASE_FILE, DEFAULT_SKU, IMAGE_DIR
 
 logger = logging.getLogger(__name__)
 
 # Common image extensions
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-SUFFIX_HISTORY_FILE = "image_suffix_history.json"
+FOLDER_STATE_FILE = "image_upload_folder_state.json"
 
 
 class ImagesUploadTab(ttk.Frame):
@@ -36,10 +36,7 @@ class ImagesUploadTab(ttk.Frame):
         self._headers: list[str] = []
         self._field_pick = tk.StringVar(value="")
         self._sku_mode = tk.StringVar(value="all")
-        self._selected_folder = tk.StringVar(value=self._initial_image_folder())
-        self._image_suffix = tk.StringVar(value="")
-        self._suffix_hint = tk.StringVar(value="")
-        self._suffix_history = self._load_suffix_history()
+        self._selected_folder = tk.StringVar(value=self._load_selected_folder())
         self._build()
 
     def _initial_image_folder(self) -> str:
@@ -47,6 +44,36 @@ class ImagesUploadTab(ttk.Frame):
         if not root.is_absolute():
             root = Path.cwd() / root
         return str(root.resolve())
+
+    def _folder_state_path(self) -> Path:
+        return Path.cwd() / FOLDER_STATE_FILE
+
+    def _load_selected_folder(self) -> str:
+        default_folder = self._initial_image_folder()
+        path = self._folder_state_path()
+        if not path.exists():
+            return default_folder
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to read folder state")
+            return default_folder
+
+        folder = str(data.get("selected_folder", "")).strip()
+        return folder if folder else default_folder
+
+    def _save_selected_folder(self, folder: str) -> None:
+        payload = {"selected_folder": folder}
+        path = self._folder_state_path()
+        try:
+            path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to save folder state")
+
+    def _set_selected_folder(self, folder: str) -> None:
+        resolved = str(Path(folder).expanduser().resolve())
+        self._selected_folder.set(resolved)
+        self._save_selected_folder(resolved)
 
     def _build(self) -> None:
         ttk.Label(
@@ -62,11 +89,13 @@ class ImagesUploadTab(ttk.Frame):
             info,
             text=(
                 "1. Select a folder containing image files.\n"
-                "2. Specify the image suffix pattern (e.g., '_main', '_alt1').\n"
-                "3. Images must be named: {SKU}{suffix}.{ext} (e.g., ABC123_main.jpg).\n"
-                "4. Choose SKU scope: All, Single, or Group.\n"
-                "5. Click 'Upload Images' to add images to Shopify products.\n"
-                "6. Images are uploaded as base64 attachments."
+                "2. Local image filenames should use SKU only (e.g., ABC123.jpg).\n"
+                "3. Target Field controls where the uploaded image is stored.\n"
+                "4. Use variants.0.metafields... for SKU-specific images; use metafields... for shared product images.\n"
+                "5. Metafield targets upload into Shopify Files and then write the resulting file URL/reference into the field.\n"
+                "6. images.*.src adds to the product image gallery instead of writing a metafield.\n"
+                "7. Choose SKU scope: All, Single, or Group.\n"
+                "8. Click 'Upload Images' to upload and update the selected field."
             ),
             justify=tk.LEFT,
             foreground="#444",
@@ -89,15 +118,16 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Label(field_row, text="Target Field:").pack(side=tk.LEFT)
         self._field_combo = ttk.Combobox(field_row, textvariable=self._field_pick, state="readonly", width=42)
         self._field_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
-        self._field_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_field_changed())
-
-        # Image suffix
-        suffix_row = ttk.Frame(options)
-        suffix_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(suffix_row, text="Image Suffix Pattern:").pack(side=tk.LEFT)
-        self._suffix_entry = ttk.Entry(suffix_row, textvariable=self._image_suffix)
-        self._suffix_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
-        ttk.Label(suffix_row, textvariable=self._suffix_hint, foreground="#999", font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(
+            options,
+            text=(
+                "Note: any header can be selected here. This tab currently writes only to "
+                "metafields.*, variants.0.metafields.*, or images.*.src. Metafield targets do not add to product gallery."
+            ),
+            foreground="#555",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 6))
 
         # SKU scope
         sku_row = ttk.Frame(options)
@@ -145,18 +175,16 @@ class ImagesUploadTab(ttk.Frame):
         tree_wrap.pack(fill=tk.BOTH, expand=False, padx=8, pady=(2, 6))
         self._tree = ttk.Treeview(
             tree_wrap,
-            columns=("filename", "size", "sku", "suffix"),
+            columns=("filename", "size", "sku"),
             show="headings",
             height=6,
         )
         self._tree.heading("filename", text="Filename")
         self._tree.heading("size", text="Size (KB)")
         self._tree.heading("sku", text="SKU")
-        self._tree.heading("suffix", text="Suffix")
         self._tree.column("filename", width=280, anchor=tk.W)
         self._tree.column("size", width=80, anchor=tk.CENTER)
         self._tree.column("sku", width=120, anchor=tk.CENTER)
-        self._tree.column("suffix", width=100, anchor=tk.CENTER)
         ysb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self._tree.yview)
         self._tree.configure(yscrollcommand=ysb.set)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -200,30 +228,112 @@ class ImagesUploadTab(ttk.Frame):
         """Deprecated: use _initial_image_folder() instead."""
         return self._initial_image_folder()
 
-    def _suffix_history_path(self) -> Path:
-        return Path.cwd() / SUFFIX_HISTORY_FILE
+    def _is_product_metafield_field(self, field_name: str) -> bool:
+        return field_name.startswith("metafields.")
 
-    def _load_suffix_history(self) -> dict[str, dict]:
-        path = self._suffix_history_path()
-        if not path.exists():
-            return {}
+    def _is_variant_metafield_field(self, field_name: str) -> bool:
+        return field_name.startswith("variants.0.metafields.")
+
+    def _is_product_image_field(self, field_name: str) -> bool:
+        return field_name.startswith("images.") and field_name.endswith(".src")
+
+    def _is_supported_field(self, field_name: str) -> bool:
+        return (
+            self._is_product_metafield_field(field_name)
+            or self._is_variant_metafield_field(field_name)
+            or self._is_product_image_field(field_name)
+        )
+
+    def _build_field_update_payload(self, field_name: str, value: str, variant_id: str = "") -> dict | None:
+        if self._is_product_metafield_field(field_name):
+            parts = field_name.split(".", 2)
+            if len(parts) != 3:
+                return None
+            _prefix, namespace, key = parts
+            return {"product": {"metafields": {namespace: {key: value}}}}
+
+        if self._is_variant_metafield_field(field_name):
+            parts = field_name.split(".", 4)
+            if len(parts) != 5 or not variant_id:
+                return None
+            _variants, _index, _metafields, namespace, key = parts
+            return {
+                "product": {
+                    "variants": [
+                        {
+                            "id": variant_id,
+                            "metafields": {namespace: {key: value}},
+                        }
+                    ]
+                }
+            }
+
+        if self._is_product_image_field(field_name):
+            return None
+
+        return None
+
+    def _resolve_metafield_upload_value(self, store: str, token: str, field_name: str, file_id: str, file_url: str) -> tuple[bool, str, str]:
+        if self._is_product_metafield_field(field_name):
+            parts = field_name.split(".", 2)
+            if len(parts) != 3:
+                return False, "", f"Invalid metafield name: {field_name}"
+            _prefix, namespace, key = parts
+            owner_type = "PRODUCT"
+        elif self._is_variant_metafield_field(field_name):
+            parts = field_name.split(".", 4)
+            if len(parts) != 5:
+                return False, "", f"Invalid variant metafield name: {field_name}"
+            _variants, _index, _metafields, namespace, key = parts
+            owner_type = "PRODUCTVARIANT"
+        else:
+            return True, file_url, ""
+
+        definition_type = get_metafield_definition_type(store, token, owner_type, namespace, key)
+        if definition_type == "file_reference":
+            if not file_id:
+                return False, "", "Shopify file upload did not return a file reference id"
+            return True, file_id, ""
+        if definition_type.startswith("list."):
+            return False, "", f"Metafield type '{definition_type}' is not supported by this tab"
+        return True, file_url, ""
+
+    def _upload_product_image(self, store: str, token: str, product_id: str, sku: str, img_path: Path) -> tuple[bool, str, str]:
+        with open(img_path, "rb") as f:
+            img_data = f.read()
+        attachment = base64.b64encode(img_data).decode("utf-8")
+
+        payload = {
+            "image": {
+                "attachment": attachment,
+                "alt": f"Product image: {sku}",
+            }
+        }
+
+        url = f"https://{store}/admin/api/2024-10/products/{product_id}/images.json"
+        resp = requests.post(
+            url,
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+            json=payload,
+            timeout=45,
+        )
+        if not resp.ok:
+            error_msg = resp.text[:300] if resp.text else f"HTTP {resp.status_code}"
+            return False, "", error_msg
+
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            logger.exception("Failed to read suffix history")
-            return {}
+            body = resp.json()
+        except ValueError:
+            body = {}
+        image = body.get("image", {}) if isinstance(body, dict) else {}
+        uploaded_src = str(image.get("src", "")).strip()
+        return True, uploaded_src, ""
 
-    def _save_suffix_history(self) -> None:
-        path = self._suffix_history_path()
-        try:
-            path.write_text(json.dumps(self._suffix_history, ensure_ascii=True, indent=2), encoding="utf-8")
-        except Exception:
-            logger.exception("Failed to save suffix history")
-
-    def _guess_suffix_from_field(self, field_name: str) -> str:
-        raw = (field_name or "").strip().split(".")[-1]
-        clean = re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
-        return f"_{clean}" if clean else "_img"
+    def _parse_local_image_sku(self, stem: str) -> tuple[str, str] | None:
+        sku = (stem or "").strip()
+        if not sku:
+            return None
+        return sku, ""
 
     def _image_fields_from_headers(self, headers: list[str]) -> list[str]:
         fields: list[str] = []
@@ -234,8 +344,7 @@ class ImagesUploadTab(ttk.Frame):
             k = key.lower()
             if k in {"id", "variants.0.id", "variants.0.sku", "sku"}:
                 continue
-            if ".src" in k or "image" in k or "img" in k:
-                fields.append(key)
+            fields.append(key)
         return fields
 
     def _load_field_options(self) -> None:
@@ -255,45 +364,13 @@ class ImagesUploadTab(ttk.Frame):
         self._field_combo["values"] = fields
         if fields and not self._field_pick.get().strip():
             self._field_pick.set(fields[0])
-        self._on_field_changed()
-
-    def _on_field_changed(self) -> None:
-        field_name = self._field_pick.get().strip()
-        if not field_name:
-            self._suffix_hint.set("e.g. _main, _alt1, etc.")
-            return
-
-        suggested = self._guess_suffix_from_field(field_name)
-        self._suffix_hint.set(f"suggestion: {suggested} (field: {field_name})")
-
-        hist = self._suffix_history.get(field_name, {})
-        prev_suffix = str(hist.get("suffix", "")).strip()
-
-        if prev_suffix:
-            if self._image_suffix.get().strip() != prev_suffix:
-                use_prev = messagebox.askyesno(
-                    "Reuse Previous Suffix",
-                    f"Field: {field_name}\nPrevious suffix: {prev_suffix}\n\nUse this suffix?",
-                    parent=self,
-                )
-                if use_prev:
-                    self._image_suffix.set(prev_suffix)
-        elif not self._image_suffix.get().strip():
-            self._image_suffix.set(suggested)
-
-    def _remember_suffix(self, field_name: str, suffix: str) -> None:
-        self._suffix_history[field_name] = {
-            "suffix": suffix,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        self._save_suffix_history()
 
     def _select_folder(self) -> None:
         current = self._selected_folder.get().strip()
         initial = current if current and Path(current).is_dir() else self._initial_image_folder()
         folder = filedialog.askdirectory(title="Select Image Folder", initialdir=initial)
         if folder:
-            self._selected_folder.set(folder)
+            self._set_selected_folder(folder)
             self._scan_available_images()
 
     def _open_selected_folder(self) -> None:
@@ -362,7 +439,6 @@ class ImagesUploadTab(ttk.Frame):
         folder = self._selected_folder.get().strip()
         if not folder:
             folder = self._initial_image_folder()
-        suffix = self._image_suffix.get().strip()
 
         self._tree.delete(*self._tree.get_children())
 
@@ -382,27 +458,15 @@ class ImagesUploadTab(ttk.Frame):
             for file_path in folder_path.glob("*"):
                 if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
                     stem = file_path.stem
-                    ext = file_path.suffix.lower()
-
-                    # Try to extract SKU and suffix from filename
-                    # Expected format: {sku}{suffix}.{ext} or just {sku}.{ext}
-                    sku = None
-                    img_suffix = ""
-
-                    if suffix:
-                        # If user specified suffix, look for {sku}{suffix}.{ext}
-                        if stem.endswith(suffix):
-                            sku = stem[: len(stem) - len(suffix)]
-                            img_suffix = suffix
-                    else:
-                        # Just use filename as SKU
-                        sku = stem
-                        img_suffix = ""
+                    parsed = self._parse_local_image_sku(stem)
+                    if not parsed:
+                        continue
+                    sku, _ = parsed
 
                     if sku:
                         size_kb = file_path.stat().st_size / 1024
-                        images.append((file_path.name, size_kb, sku, img_suffix))
-                        self._tree.insert("", "end", values=(file_path.name, f"{size_kb:.1f}", sku, img_suffix))
+                        images.append((file_path.name, size_kb, sku))
+                        self._tree.insert("", "end", values=(file_path.name, f"{size_kb:.1f}", sku))
 
             self._log(f"Found {len(images)} image(s) in folder.")
             self._stats.set(f"Available: {len(images)} image(s)")
@@ -430,7 +494,6 @@ class ImagesUploadTab(ttk.Frame):
         """Start upload process in background thread."""
         folder = self._selected_folder.get().strip()
         field_name = self._field_pick.get().strip()
-        suffix = self._image_suffix.get().strip()
 
         if not folder:
             messagebox.showwarning("No Folder", "Please select an image folder.", parent=self)
@@ -438,6 +501,18 @@ class ImagesUploadTab(ttk.Frame):
 
         if not field_name:
             messagebox.showwarning("No Field", "Please select target field first.", parent=self)
+            return
+
+        if not self._is_supported_field(field_name):
+            messagebox.showerror(
+                "Unsupported Field",
+                (
+                    "This tab currently supports product metafields (metafields.*), "
+                    "variant metafields (variants.0.metafields.*), and product image gallery fields "
+                    "(images.*.src)."
+                ),
+                parent=self,
+            )
             return
 
         if not Path(folder).is_dir():
@@ -451,19 +526,25 @@ class ImagesUploadTab(ttk.Frame):
         # Confirm upload start
         sku_set = self._selected_sku_set()
         scope_desc = f"({len(sku_set)} SKUs)" if sku_set else "(all SKUs)"
-        sample_name = f"SAMPLESKU{suffix}.jpg" if suffix else "SAMPLESKU.jpg"
+        sample_name = "SAMPLESKU.jpg"
+        if self._is_variant_metafield_field(field_name):
+            field_mode = "Variant metafield"
+        elif self._is_product_metafield_field(field_name):
+            field_mode = "Product metafield"
+        else:
+            field_mode = "Product image gallery"
+        storage_mode = "Shopify Files" if not self._is_product_image_field(field_name) else "Product gallery"
         msg = (
             f"Upload images from:\n{folder}\n\n"
             f"Field: {field_name}\n"
-            f"Suffix: {suffix if suffix else '(none)'}\n"
-            f"Filename format: {sample_name}\n"
+            f"Field mode: {field_mode}\n"
+            f"Storage mode: {storage_mode}\n"
+            f"Local filename format: {sample_name}\n"
             f"Scope: {scope_desc}\n\n"
             "Is this correct?"
         )
         if not self._app.confirm("Confirm Image Upload", msg):
             return
-
-        self._remember_suffix(field_name, suffix)
 
         self._running = True
         self._app.start_prog("determinate", use_busy_cursor=False)
@@ -471,7 +552,7 @@ class ImagesUploadTab(ttk.Frame):
 
         def task():
             try:
-                self._run_upload_task(store, token, folder, suffix, sku_set)
+                self._run_upload_task(store, token, folder, sku_set)
             except Exception as exc:
                 logger.exception("Upload task crashed")
                 self._ui_async(lambda: self._app.stop_prog(clear_busy_cursor=False))
@@ -482,10 +563,11 @@ class ImagesUploadTab(ttk.Frame):
         thread = threading.Thread(target=task, daemon=True)
         thread.start()
 
-    def _run_upload_task(self, store: str, token: str, folder: str, suffix: str, sku_set: set[str]) -> None:
+    def _run_upload_task(self, store: str, token: str, folder: str, sku_set: set[str]) -> None:
         """Execute the upload task."""
         start_time = time.time()
         wb = None
+        field_name = self._field_pick.get().strip()
 
         try:
             # Load database to get SKU->ID mapping
@@ -497,10 +579,12 @@ class ImagesUploadTab(ttk.Frame):
             headers = [str(h or "").strip() for h in (header_row or [])]
             id_idx = self._find_col_idx(headers, {"id"})
             sku_idx = self._find_col_idx(headers, {"variants.0.sku", "sku"})
+            variant_id_idx = self._find_col_idx(headers, {"variants.0.id"})
             if id_idx is None or sku_idx is None:
                 raise RuntimeError("Database must contain 'id' and 'variants.0.sku' (or 'sku') columns.")
 
             sku_to_id = {}
+            sku_to_variant_id: dict[str, str] = {}
             for row in ws.iter_rows(min_row=2, values_only=True):
                 if len(row) <= max(id_idx, sku_idx):
                     continue
@@ -508,6 +592,8 @@ class ImagesUploadTab(ttk.Frame):
                 sku = str(row[sku_idx]).strip() if row[sku_idx] else ""
                 if prod_id and sku and sku != DEFAULT_SKU:
                     sku_to_id[sku] = prod_id
+                    if variant_id_idx is not None and len(row) > variant_id_idx and row[variant_id_idx]:
+                        sku_to_variant_id[sku] = str(row[variant_id_idx]).strip()
             self._log(f"Loaded {len(sku_to_id)} SKU→ID mappings from database")
 
             # Scan folder for images
@@ -518,12 +604,10 @@ class ImagesUploadTab(ttk.Frame):
             for file_path in folder_path.glob("*"):
                 if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS:
                     stem = file_path.stem
-                    sku = None
-                    if suffix:
-                        if stem.endswith(suffix):
-                            sku = stem[: len(stem) - len(suffix)]
-                    else:
-                        sku = stem
+                    parsed = self._parse_local_image_sku(stem)
+                    if not parsed:
+                        continue
+                    sku, _ = parsed
 
                     if sku:
                         if sku not in images_by_sku:
@@ -540,6 +624,16 @@ class ImagesUploadTab(ttk.Frame):
                 self._ui_async(lambda: self._log("No matching SKUs found in database."))
                 self._ui_async(lambda: self._app.stop_prog(clear_busy_cursor=False))
                 return
+
+            if self._is_variant_metafield_field(field_name):
+                missing_variant_ids = [sku for sku in sorted(upload_skus) if sku not in sku_to_variant_id]
+                if missing_variant_ids:
+                    preview = ", ".join(missing_variant_ids[:10])
+                    more = "..." if len(missing_variant_ids) > 10 else ""
+                    raise RuntimeError(
+                        "Selected variant metafield requires variants.0.id in the database for every SKU. "
+                        f"Missing variant ids for: {preview}{more}"
+                    )
 
             self._log(f"Will upload to {len(upload_skus)} product(s)")
 
@@ -570,34 +664,53 @@ class ImagesUploadTab(ttk.Frame):
                             self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ (not readable or empty)")
                             continue
                         
-                        # Read and encode image
-                        with open(img_path, "rb") as f:
-                            img_data = f.read()
-                        attachment = base64.b64encode(img_data).decode("utf-8")
-
-                        # Upload to Shopify
-                        payload = {
-                            "image": {
-                                "attachment": attachment,
-                                "alt": f"Product image: {sku}",
-                            }
-                        }
-
-                        url = f"https://{store}/admin/api/2024-10/products/{prod_id}/images.json"
-                        resp = requests.post(
-                            url,
-                            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-                            json=payload,
-                            timeout=45,
-                        )
-
-                        if resp.ok:
-                            ok_count += 1
-                            self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✓")
+                        if self._is_product_image_field(field_name):
+                            ok_upload, uploaded_value, upload_error = self._upload_product_image(store, token, prod_id, sku, img_path)
                         else:
+                            ok_upload, uploaded_file_id, uploaded_file_url, upload_error = upload_file_to_shopify_files(
+                                store,
+                                token,
+                                img_path,
+                                alt=f"Product image: {sku}",
+                            )
+                            if ok_upload:
+                                ok_value, uploaded_value, value_error = self._resolve_metafield_upload_value(
+                                    store,
+                                    token,
+                                    field_name,
+                                    uploaded_file_id,
+                                    uploaded_file_url,
+                                )
+                                if not ok_value:
+                                    fail_count += 1
+                                    self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ ({value_error})")
+                                    continue
+                        if not ok_upload:
                             fail_count += 1
-                            error_msg = resp.text[:100] if resp.text else f"HTTP {resp.status_code}"
-                            self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ ({error_msg})")
+                            self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ ({upload_error})")
+                            continue
+
+                        field_payload = self._build_field_update_payload(
+                            field_name,
+                            uploaded_value,
+                            sku_to_variant_id.get(sku, ""),
+                        )
+                        if not self._is_product_image_field(field_name) and field_payload is None:
+                            fail_count += 1
+                            self._log(
+                                f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ "
+                                f"(unsupported field mapping: {field_name})"
+                            )
+                            continue
+                        if field_payload is not None:
+                            ok_field, _status_field, msg_field = update_product_api(store, token, prod_id, field_payload)
+                            if not ok_field:
+                                fail_count += 1
+                                self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✗ (field update failed: {msg_field})")
+                                continue
+
+                        ok_count += 1
+                        self._log(f"  [{i + 1}/{len(upload_skus)}] SKU {sku}: {img_path.name} ✓")
 
                     except Exception as e:
                         fail_count += 1
