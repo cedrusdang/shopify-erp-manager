@@ -198,10 +198,8 @@ class ImagesUploadTab(ttk.Frame):
             self._sku_group_entry.config(state="disabled")
 
     def _image_root_dir(self) -> str:
-        root = Path(IMAGE_DIR)
-        if not root.is_absolute():
-            root = Path.cwd() / root
-        return str(root.resolve())
+        """Alias for _initial_image_folder for backward compatibility."""
+        return self._initial_image_folder()
 
     def _suffix_history_path(self) -> Path:
         return Path.cwd() / SUFFIX_HISTORY_FILE
@@ -293,9 +291,11 @@ class ImagesUploadTab(ttk.Frame):
 
     def _select_folder(self) -> None:
         current = self._selected_folder.get().strip()
-        initial = current if current and Path(current).is_dir() else self._image_root_dir()
+        initial = current if current and Path(current).is_dir() else self._initial_image_folder()
+        self._log(f"[DEBUG] Browse dialog initialdir: {initial}")
         folder = filedialog.askdirectory(title="Select Image Folder", initialdir=initial)
         if folder:
+            self._log(f"[DEBUG] Selected folder: {folder}")
             self._selected_folder.set(folder)
             self._scan_available_images()
 
@@ -303,10 +303,14 @@ class ImagesUploadTab(ttk.Frame):
         folder = self._selected_folder.get().strip()
         if not folder:
             folder = self._initial_image_folder()
+            self._log(f"[DEBUG] No selection, fallback to: {folder}")
+        else:
+            self._log(f"[DEBUG] Open folder: {folder}")
         if not folder:
             messagebox.showwarning("No Folder", "No image folder available.", parent=self)
             return
         if not Path(folder).is_dir():
+            self._log(f"[DEBUG] Folder does not exist: {folder}")
             messagebox.showerror("Invalid Folder", f"Folder not found: {folder}", parent=self)
             return
         try:
