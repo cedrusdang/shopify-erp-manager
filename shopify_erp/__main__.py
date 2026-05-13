@@ -12,7 +12,8 @@ from .logger import setup_logging
 logger = setup_logging(log_dir="logs")
 
 # Suppress console output on Windows (hide CLI/console window) - but keep logging
-if sys.platform == "win32" and not sys.stdout.isatty():
+stdout_obj = getattr(sys, "stdout", None)
+if sys.platform == "win32" and (stdout_obj is None or not stdout_obj.isatty()):
     try:
         sys.stdout = open(os.devnull, "w")
         sys.stderr = open(os.devnull, "w")

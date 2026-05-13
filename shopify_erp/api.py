@@ -479,6 +479,152 @@ def fetch_first_variant_id(store: str, token: str, product_id: str) -> str | Non
         return None
 
 
+def delete_product_image_by_field(
+    store: str,
+    token: str,
+    product_id: str,
+    field_name: str,
+    max_retries: int = 5,
+) -> tuple[bool, int, str]:
+    """Delete product gallery images addressed by images or images.N.src."""
+
+    normalized = str(field_name or "").strip()
+    delete_all = normalized == "images"
+    match = re.fullmatch(r"images\.(\d+)\.src", normalized)
+    if not delete_all and not match:
+        return False, 0, f"Unsupported image field: {field_name}"
+
+    pid = _gid_tail(str(product_id or "").strip())
+    if not pid:
+        return False, 0, "Missing product id"
+
+    target_index = int(match.group(1)) if match else -1
+    wait = 1.0
+
+    for _attempt in range(max_retries):
+        try:
+            url_list = f"{_rest_base_url(store)}/products/{quote(pid)}/images.json"
+            resp_list = requests.get(url_list, headers=_headers(token), timeout=30)
+            if not resp_list.ok:
+                msg = f"HTTP {resp_list.status_code}: {resp_list.text[:300]}"
+                if resp_list.status_code == 429 or "throttle" in msg.lower():
+                    time.sleep(wait)
+                    wait = min(wait * 2, 32)
+                    continue
+                return False, resp_list.status_code, msg
+
+            body = resp_list.json() if resp_list.content else {}
+            images = body.get("images", []) if isinstance(body, dict) else []
+            if not isinstance(images, list):
+                images = []
+            if delete_all:
+                if not images:
+                    return True, 200, ""
+                delete_ids = [str(img.get("id", "")).strip() for img in images if isinstance(img, dict) and str(img.get("id", "")).strip()]
+                if not delete_ids:
+                    return True, 200, ""
+            elif target_index >= len(images):
+                return True, 200, ""
+            else:
+                image_obj = images[target_index] if isinstance(images[target_index], dict) else {}
+                image_id = str(image_obj.get("id", "")).strip()
+                if not image_id:
+                    return False, 0, f"Image field {field_name} does not map to a valid Shopify image id"
+                delete_ids = [image_id]
+
+            for image_id in delete_ids:
+                url_delete = f"{_rest_base_url(store)}/products/{quote(pid)}/images/{quote(image_id)}.json"
+                resp_delete = requests.delete(url_delete, headers=_headers(token), timeout=30)
+                if resp_delete.ok or resp_delete.status_code == 404:
+                    continue
+
+                msg = f"HTTP {resp_delete.status_code}: {resp_delete.text[:300]}"
+                if resp_delete.status_code == 429 or "throttle" in msg.lower():
+                    time.sleep(wait)
+                    wait = min(wait * 2, 32)
+                    break
+                return False, resp_delete.status_code, msg
+            else:
+                return True, 200, ""
+        except requests.RequestException as exc:
+            time.sleep(wait)
+            wait = min(wait * 2, 32)
+        except Exception as exc:
+            return False, 0, str(exc)[:500]
+
+    return False, 0, f"Max retries exceeded ({max_retries})"
+
+
+def clear_product_metafield(
+    store: str,
+    token: str,
+    product_id: str,
+    field_name: str,
+    max_retries: int = 5,
+) -> tuple[bool, int, str]:
+    """Delete a product metafield addressed by metafields.namespace.key."""
+
+    parts = str(field_name or "").strip().split(".", 2)
+    if len(parts) != 3 or parts[0] != "metafields":
+        return False, 0, f"Unsupported product metafield: {field_name}"
+
+    _prefix, namespace, key = parts
+    pid = _gid_tail(str(product_id or "").strip())
+    if not pid:
+        return False, 0, "Missing product id"
+
+    wait = 1.0
+
+    for _attempt in range(max_retries):
+        try:
+            url_list = f"{_rest_base_url(store)}/products/{quote(pid)}/metafields.json"
+            resp_list = requests.get(
+                url_list,
+                headers=_headers(token),
+                params={"namespace": namespace, "key": key, "limit": 1},
+                timeout=30,
+            )
+            if not resp_list.ok:
+                msg = f"HTTP {resp_list.status_code}: {resp_list.text[:300]}"
+                if resp_list.status_code == 429 or "throttle" in msg.lower():
+                    time.sleep(wait)
+                    wait = min(wait * 2, 32)
+                    continue
+                return False, resp_list.status_code, msg
+
+            body = resp_list.json() if resp_list.content else {}
+            items = body.get("metafields", []) if isinstance(body, dict) else []
+            if not isinstance(items, list) or not items:
+                return True, 200, ""
+
+            first = items[0] if isinstance(items[0], dict) else {}
+            metafield_id = str(first.get("id", "")).strip()
+            if not metafield_id:
+                return False, 0, f"Metafield {field_name} does not map to a valid Shopify metafield id"
+
+            url_delete = f"{_rest_base_url(store)}/metafields/{quote(metafield_id)}.json"
+            resp_delete = requests.delete(url_delete, headers=_headers(token), timeout=30)
+            if resp_delete.ok:
+                return True, 200, ""
+
+            msg = f"HTTP {resp_delete.status_code}: {resp_delete.text[:300]}"
+            if resp_delete.status_code == 404:
+                return True, 200, ""
+            if resp_delete.status_code == 429 or "throttle" in msg.lower():
+                time.sleep(wait)
+                wait = min(wait * 2, 32)
+                continue
+            return False, resp_delete.status_code, msg
+        except requests.RequestException as exc:
+            time.sleep(wait)
+            wait = min(wait * 2, 32)
+            last_error = str(exc)
+        except Exception as exc:
+            return False, 0, str(exc)[:500]
+
+    return False, 0, f"Max retries exceeded ({max_retries})"
+
+
 def fetch_all_products(
     store: str,
     token: str,

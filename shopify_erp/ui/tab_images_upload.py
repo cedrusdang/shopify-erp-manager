@@ -121,9 +121,8 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Label(
             options,
             text=(
-                "Note: UI selection may show many headers, but this upload flow is intended only for "
-                "metafields.custom.xxx, variants.0.metafields.custom.xxx, or images.*.src. "
-                "Metafield targets do not add to product gallery."
+                "Note: this upload flow supports only 2 field shapes: images.0.src and "
+                "metafields.custom.ecom_img_1. Metafield targets do not add to product gallery."
             ),
             foreground="#555",
             font=("Segoe UI", 8),
