@@ -18,6 +18,7 @@ from tkinter import ttk, messagebox
 from ..api import fetch_access_token, test_connection
 from ..config import load_env
 from ..constants import APP_TITLE, APP_VER, CONTACT, DEF_NAME
+from ..logger import log_work_event
 from ..session import load_session
 
 from .tab_download import DownloadTab
@@ -30,6 +31,7 @@ from .tab_images_delete import ImagesDeleteTab
 from .tab_images_upload import ImagesUploadTab
 from .tab_logs     import LogsTab
 from .tab_shopify_mimic import ShopifyMimicTab
+from .tab_work_logs import WorkLogsTab
 from .live_database_panel import LiveDatabasePanel
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,7 @@ class ShopifyERPApp(tk.Tk):
         self._live_db.start_auto_refresh()
         self._live_db_full.start_auto_refresh()
         self._tab_logs.start_auto_refresh()
+        self._tab_work_logs.start_auto_refresh()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._auto_initialize_connection)
         self._busy_cursor_locks = 0
@@ -179,6 +182,7 @@ class ShopifyERPApp(tk.Tk):
         self._tab_settings = SettingsTab(nb, self)
         self._tab_help     = HelpTab(nb, self)
         self._tab_logs     = LogsTab(nb, self)
+        self._tab_work_logs = WorkLogsTab(nb, self)
 
         self._tab_live_full = ttk.Frame(nb)
         self._live_db_full = LiveDatabasePanel(
@@ -198,6 +202,7 @@ class ShopifyERPApp(tk.Tk):
         nb.add(self._tab_backup,   text="  💾  Backup  ")
         nb.add(self._tab_live_full, text="  🗄  Live DB (Full)  ")
         nb.add(self._tab_logs,     text="  📋  Logs  ")
+        nb.add(self._tab_work_logs, text="  🧾  Work Logs  ")
         nb.add(self._tab_settings, text="  ⚙  Settings  ")
         nb.add(self._tab_help,     text="  ❓  Help  ")
         nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -225,6 +230,7 @@ class ShopifyERPApp(tk.Tk):
     # ──────────────────────────────────────────────────
     def set_status(self, msg: str) -> None:
         self._status_var.set(msg)
+        log_work_event(f"STATUS | {msg}")
         self.update_idletasks()
 
     def log(self, widget: scrolledtext.ScrolledText, msg: str) -> None:
@@ -234,6 +240,7 @@ class ShopifyERPApp(tk.Tk):
         widget.config(state="disabled")
         # Persist tab-level UI log lines into file logs for later troubleshooting.
         logger.info(msg)
+        log_work_event(msg)
 
     def _acquire_busy_cursor(self) -> None:
         # Busy cursor disabled - rely on status text instead
@@ -247,22 +254,28 @@ class ShopifyERPApp(tk.Tk):
         # Indeterminate spinner disabled - use status text instead
         self._prog.config(mode="determinate", value=0)
         self._prog.stop()
+        log_work_event(f"PROGRESS | start mode={mode}")
 
     def stop_prog(self, clear_busy_cursor: bool = True) -> None:
         self._prog.stop()
         self._prog.config(mode="determinate", value=0)
         if clear_busy_cursor:
             self._release_busy_cursor()
+        log_work_event("PROGRESS | stop")
 
     def set_prog_value(self, value: int, maximum: int) -> None:
         self._prog["maximum"] = maximum
         self._prog["value"]   = value
 
     def confirm(self, title: str, msg: str) -> bool:
-        return messagebox.askyesno(title, msg, parent=self)
+        decision = messagebox.askyesno(title, msg, parent=self)
+        log_work_event(f"CONFIRM | {title} | {'yes' if decision else 'no'}")
+        return decision
 
     def confirm_danger(self, title: str, msg: str) -> bool:
-        return messagebox.askyesno(title, msg, parent=self)
+        decision = messagebox.askyesno(title, msg, parent=self)
+        log_work_event(f"CONFIRM_DANGER | {title} | {'yes' if decision else 'no'}")
+        return decision
 
     def get_conn(self) -> tuple[str | None, str | None]:
         s = self._normalize_store_domain(self.store.get())
@@ -441,6 +454,7 @@ class ShopifyERPApp(tk.Tk):
         self._live_db.stop_auto_refresh()
         self._live_db_full.stop_auto_refresh()
         self._tab_logs.stop_auto_refresh()
+        self._tab_work_logs.stop_auto_refresh()
         self.destroy()
 
     # ──────────────────────────────────────────────────

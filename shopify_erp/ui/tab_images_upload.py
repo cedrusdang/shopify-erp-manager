@@ -93,7 +93,7 @@ class ImagesUploadTab(ttk.Frame):
                 "3. Target Field controls where the uploaded image is stored.\n"
                 "4. Use variants.0.metafields... for SKU-specific images; use metafields... for shared product images.\n"
                 "5. Metafield targets upload into Shopify Files and then write the resulting file URL/reference into the field.\n"
-                "6. images.*.src adds to the product image gallery instead of writing a metafield.\n"
+                "6. images and images.*.src both add to the product image gallery instead of writing a metafield.\n"
                 "7. Choose SKU scope: All, Single, or Group.\n"
                 "8. Click 'Upload Images' to upload and update the selected field."
             ),
@@ -121,8 +121,8 @@ class ImagesUploadTab(ttk.Frame):
         ttk.Label(
             options,
             text=(
-                "Note: this upload flow supports only 2 field shapes: images.0.src and "
-                "metafields.custom.ecom_img_1. Metafield targets do not add to product gallery."
+                "Note: gallery uploads support images and images.*.src; metafield uploads support "
+                "metafields.custom.ecom_img_1. Gallery targets append images instead of replacing the field value."
             ),
             foreground="#555",
             font=("Segoe UI", 8),
@@ -235,7 +235,7 @@ class ImagesUploadTab(ttk.Frame):
         return field_name.startswith("variants.0.metafields.")
 
     def _is_product_image_field(self, field_name: str) -> bool:
-        return field_name.startswith("images.") and field_name.endswith(".src")
+        return field_name == "images" or (field_name.startswith("images.") and field_name.endswith(".src"))
 
     def _is_supported_field(self, field_name: str) -> bool:
         return (
@@ -509,7 +509,7 @@ class ImagesUploadTab(ttk.Frame):
                 (
                     "This tab currently supports product metafields (metafields.*), "
                     "variant metafields (variants.0.metafields.*), and product image gallery fields "
-                    "(images.*.src)."
+                    "(images, images.*.src)."
                 ),
                 parent=self,
             )
