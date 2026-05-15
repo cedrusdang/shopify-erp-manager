@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 import logging.handlers
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+import threading
 
 
 WORK_LOGGER_NAME = "shopify_erp.worklog"
+WORK_TABLE_COLUMNS = [
+    "timestamp",
+    "area",
+    "operation",
+    "method",
+    "endpoint",
+    "product_id",
+    "variant_id",
+    "field_name",
+    "status_code",
+    "outcome",
+    "details",
+]
+
+_WORK_TABLE_LOCK = threading.Lock()
 
 
 def setup_logging(log_dir: str = "logs") -> logging.Logger:
@@ -112,6 +129,33 @@ def get_logger(name: str | None = None) -> logging.Logger:
 def get_work_logger() -> logging.Logger:
     """Get the dedicated work logger."""
     return logging.getLogger(WORK_LOGGER_NAME)
+
+
+def get_work_table_path(log_dir: str = "logs") -> Path:
+    """Return the structured work-log table path for today."""
+    log_path = Path(log_dir)
+    log_path.mkdir(exist_ok=True)
+    return log_path / f"shopify_erp_work_table_{datetime.now().strftime('%Y%m%d')}.tsv"
+
+
+def append_work_table_row(row: dict[str, object], log_dir: str = "logs") -> None:
+    """Append a structured workflow/API row into the TSV work-log table."""
+    table_path = get_work_table_path(log_dir)
+    normalized: dict[str, str] = {}
+    for key in WORK_TABLE_COLUMNS:
+        value = row.get(key, "")
+        if key == "timestamp" and not value:
+            value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = str(value or "")
+        normalized[key] = text.replace("\r", " ").replace("\n", " ").strip()
+
+    with _WORK_TABLE_LOCK:
+        file_exists = table_path.exists()
+        with table_path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=WORK_TABLE_COLUMNS, delimiter="\t")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(normalized)
 
 
 def log_work_event(message: str) -> None:

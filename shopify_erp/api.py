@@ -13,6 +13,7 @@ from urllib.parse import quote, unquote
 import requests
 
 from .constants import API_VER
+from .logger import append_work_table_row
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,48 @@ logger = logging.getLogger(__name__)
 # verify once (first owner/first SKU), then reuse known type/strategy for next rows.
 _METAFIELD_VERIFY_CACHE: dict[tuple[str, str, str], dict[str, str]] = {}
 _METAFIELD_DEFINITION_TYPE_CACHE: dict[tuple[str, str, str], str] = {}
+
+
+def _short_work_text(value: object, limit: int = 220) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _graphql_operation_name(query: str) -> str:
+    match = re.search(r"\b(query|mutation)\s+([A-Za-z0-9_]+)", str(query or ""))
+    if match:
+        return match.group(2)
+    return "graphql"
+
+
+def _log_api_table_row(
+    area: str,
+    operation: str,
+    method: str,
+    endpoint: str,
+    product_id: str = "",
+    variant_id: str = "",
+    field_name: str = "",
+    status_code: int | str = "",
+    outcome: str = "",
+    details: str = "",
+) -> None:
+    append_work_table_row(
+        {
+            "area": area,
+            "operation": operation,
+            "method": method,
+            "endpoint": endpoint,
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "field_name": field_name,
+            "status_code": status_code,
+            "outcome": outcome,
+            "details": _short_work_text(details),
+        }
+    )
 
 
 # ──────────────────────────────────────────────────────────
@@ -37,22 +80,62 @@ def _rest_base_url(store: str) -> str:
 
 
 def _graphql_url(store: str) -> str:
-        return f"https://{store}/admin/api/{API_VER}/graphql.json"
+    return f"https://{store}/admin/api/{API_VER}/graphql.json"
 
 
 def _graphql_post(store: str, token: str, query: str, variables: dict | None = None, timeout: int = 45) -> dict:
-        payload: dict[str, object] = {"query": query}
-        if variables is not None:
-                payload["variables"] = variables
+    payload: dict[str, object] = {"query": query}
+    if variables is not None:
+        payload["variables"] = variables
+    operation_name = _graphql_operation_name(query)
+    try:
         resp = requests.post(_graphql_url(store), headers=_headers(token), json=payload, timeout=timeout)
-        if not resp.ok:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        body = resp.json() if resp.content else {}
-        errors = body.get("errors", []) if isinstance(body, dict) else []
-        if errors:
-                first = errors[0] if isinstance(errors[0], dict) else {}
-                raise RuntimeError(str(first.get("message", "GraphQL request failed")))
-        return body.get("data", {}) if isinstance(body, dict) else {}
+    except requests.RequestException as exc:
+        _log_api_table_row(
+            area="graphql",
+            operation=operation_name,
+            method="POST",
+            endpoint=_graphql_url(store),
+            status_code=0,
+            outcome="EXCEPTION",
+            details=str(exc),
+        )
+        raise
+    if not resp.ok:
+        _log_api_table_row(
+            area="graphql",
+            operation=operation_name,
+            method="POST",
+            endpoint=_graphql_url(store),
+            status_code=resp.status_code,
+            outcome="FAIL",
+            details=resp.text[:300],
+        )
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+    body = resp.json() if resp.content else {}
+    errors = body.get("errors", []) if isinstance(body, dict) else []
+    if errors:
+        first = errors[0] if isinstance(errors[0], dict) else {}
+        _log_api_table_row(
+            area="graphql",
+            operation=operation_name,
+            method="POST",
+            endpoint=_graphql_url(store),
+            status_code=resp.status_code,
+            outcome="GRAPHQL_ERROR",
+            details=str(first.get("message", "GraphQL request failed")),
+        )
+        raise RuntimeError(str(first.get("message", "GraphQL request failed")))
+    _log_api_table_row(
+        area="graphql",
+        operation=operation_name,
+        method="POST",
+        endpoint=_graphql_url(store),
+        status_code=resp.status_code,
+        outcome="OK",
+        details=f"variables={sorted((variables or {}).keys())}",
+    )
+    return body.get("data", {}) if isinstance(body, dict) else {}
 
 
 def get_metafield_definition_type(store: str, token: str, owner_type: str, namespace: str, key: str) -> str:
@@ -109,9 +192,18 @@ def _extract_shopify_file_url(file_node: dict) -> str:
 
 
 def upload_file_to_shopify_files(store: str, token: str, file_path: str | Path, alt: str = "") -> tuple[bool, str, str, str]:
-        path = Path(file_path)
-        if not path.is_file():
-                return False, "", "", f"File not found: {path}"
+    path = Path(file_path)
+    if not path.is_file():
+        _log_api_table_row(
+            area="files",
+            operation="upload_file_to_shopify_files",
+            method="POST",
+            endpoint="shopify-files",
+            status_code=0,
+            outcome="FAIL",
+            details=f"File not found: {path}",
+        )
+        return False, "", "", f"File not found: {path}"
 
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         content_type = "IMAGE" if mime_type.startswith("image/") else "FILE"
@@ -183,7 +275,27 @@ def upload_file_to_shopify_files(store: str, token: str, file_path: str | Path, 
                         timeout=120,
                 )
         if not resp_upload.ok:
-                return False, "", "", f"HTTP {resp_upload.status_code}: {resp_upload.text[:300]}"
+            _log_api_table_row(
+                area="files",
+                operation="staged_upload_post",
+                method="POST",
+                endpoint=upload_url,
+                field_name=path.name,
+                status_code=resp_upload.status_code,
+                outcome="FAIL",
+                details=resp_upload.text[:300],
+            )
+            return False, "", "", f"HTTP {resp_upload.status_code}: {resp_upload.text[:300]}"
+        _log_api_table_row(
+            area="files",
+            operation="staged_upload_post",
+            method="POST",
+            endpoint=upload_url,
+            field_name=path.name,
+            status_code=resp_upload.status_code,
+            outcome="OK",
+            details=f"resource={content_type}",
+        )
 
         query_create = """
         mutation CreateFile($files: [FileCreateInput!]!) {
@@ -240,6 +352,16 @@ def upload_file_to_shopify_files(store: str, token: str, file_path: str | Path, 
         file_id = str(file_node.get("id", "")).strip()
         file_status = str(file_node.get("fileStatus", "")).strip().upper()
         file_url = _extract_shopify_file_url(file_node)
+        _log_api_table_row(
+            area="files",
+            operation="file_create_result",
+            method="POST",
+            endpoint=_graphql_url(store),
+            field_name=path.name,
+            status_code=200,
+            outcome="OK" if file_id else "FAIL",
+            details=f"file_id={file_id or '-'} status={file_status or '-'}",
+        )
 
         query_poll = """
         query ShopifyFileNode($id: ID!) {
@@ -270,18 +392,48 @@ def upload_file_to_shopify_files(store: str, token: str, file_path: str | Path, 
         }
         """
         for _attempt in range(10):
-                if file_id and file_url and file_status == "READY":
-                        return True, file_id, file_url, ""
-                if not file_id:
-                        break
-                time.sleep(1)
-                data_poll = _graphql_post(store, token, query_poll, variables={"id": file_id}, timeout=45)
-                file_node = (data_poll or {}).get("node") or {}
-                file_status = str(file_node.get("fileStatus", file_status)).strip().upper()
-                file_url = _extract_shopify_file_url(file_node) or file_url
+            if file_id and file_url and file_status == "READY":
+                _log_api_table_row(
+                    area="files",
+                    operation="file_ready",
+                    method="POST",
+                    endpoint=_graphql_url(store),
+                    field_name=path.name,
+                    status_code=200,
+                    outcome="OK",
+                    details=f"file_id={file_id}",
+                )
+                return True, file_id, file_url, ""
+            if not file_id:
+                break
+            time.sleep(1)
+            data_poll = _graphql_post(store, token, query_poll, variables={"id": file_id}, timeout=45)
+            file_node = (data_poll or {}).get("node") or {}
+            file_status = str(file_node.get("fileStatus", file_status)).strip().upper()
+            file_url = _extract_shopify_file_url(file_node) or file_url
 
         if file_id and file_url:
-                return True, file_id, file_url, ""
+            _log_api_table_row(
+                area="files",
+                operation="file_ready_partial",
+                method="POST",
+                endpoint=_graphql_url(store),
+                field_name=path.name,
+                status_code=200,
+                outcome="OK",
+                details=f"file_id={file_id} status={file_status}",
+            )
+            return True, file_id, file_url, ""
+        _log_api_table_row(
+            area="files",
+            operation="file_ready_timeout",
+            method="POST",
+            endpoint=_graphql_url(store),
+            field_name=path.name,
+            status_code=0,
+            outcome="FAIL",
+            details="Shopify file upload finished without a usable file URL",
+        )
         return False, file_id, file_url, "Shopify file upload finished without a usable file URL"
 
 
@@ -400,19 +552,24 @@ def fetch_access_token(
         resp = requests.post(url, headers=headers, data=data, timeout=20)
         if not resp.ok:
             err_msg = f"HTTP {resp.status_code}: {resp.text[:300]}"
+            _log_api_table_row("auth", "fetch_access_token", "POST", url, status_code=resp.status_code, outcome="FAIL", details=err_msg)
             logger.error(f"Failed to fetch token: {err_msg}")
             return False, err_msg
         body = resp.json()
         token = body.get("access_token", "").strip()
         if not token:
+            _log_api_table_row("auth", "fetch_access_token", "POST", url, status_code=resp.status_code, outcome="FAIL", details="No access_token found")
             logger.error("No access_token found in token response")
             return False, "No access_token found in response."
+        _log_api_table_row("auth", "fetch_access_token", "POST", url, status_code=resp.status_code, outcome="OK", details=f"store={store}")
         logger.info(f"Successfully fetched access token for {store}")
         return True, token
     except requests.RequestException as exc:
+        _log_api_table_row("auth", "fetch_access_token", "POST", url, status_code=0, outcome="EXCEPTION", details=str(exc))
         logger.error(f"Token request exception: {exc}", exc_info=True)
         return False, str(exc)
     except ValueError as exc:
+        _log_api_table_row("auth", "fetch_access_token", "POST", url, status_code=0, outcome="EXCEPTION", details="Token response is not valid JSON")
         logger.error(f"Token response JSON parse error: {exc}", exc_info=True)
         return False, "Token response is not valid JSON."
 
@@ -439,12 +596,17 @@ def test_connection(store: str, token: str) -> tuple[bool, str]:
         url = f"{_rest_base_url(store)}/shop.json"
         resp = requests.get(url, headers=_headers(token), timeout=15)
         if not resp.ok:
+            _log_api_table_row("connection", "test_connection", "GET", url, status_code=resp.status_code, outcome="FAIL", details=resp.text[:300])
             return False, f"HTTP {resp.status_code}: {resp.text[:300]}"
         body = resp.json()
-        return True, body.get("shop", {}).get("name", store)
+        shop_name = body.get("shop", {}).get("name", store)
+        _log_api_table_row("connection", "test_connection", "GET", url, status_code=resp.status_code, outcome="OK", details=str(shop_name))
+        return True, shop_name
     except requests.RequestException as exc:
+        _log_api_table_row("connection", "test_connection", "GET", f"{_rest_base_url(store)}/shop.json", status_code=0, outcome="EXCEPTION", details=str(exc))
         return False, str(exc)
     except ValueError:
+        _log_api_table_row("connection", "test_connection", "GET", f"{_rest_base_url(store)}/shop.json", status_code=0, outcome="EXCEPTION", details="Shop response is not valid JSON")
         return False, "Shop response is not valid JSON."
 
 
@@ -507,6 +669,7 @@ def delete_product_image_by_field(
             resp_list = requests.get(url_list, headers=_headers(token), timeout=30)
             if not resp_list.ok:
                 msg = f"HTTP {resp_list.status_code}: {resp_list.text[:300]}"
+                _log_api_table_row("image-delete", "list_product_images", "GET", url_list, product_id=pid, field_name=field_name, status_code=resp_list.status_code, outcome="FAIL", details=msg)
                 if resp_list.status_code == 429 or "throttle" in msg.lower():
                     time.sleep(wait)
                     wait = min(wait * 2, 32)
@@ -536,9 +699,11 @@ def delete_product_image_by_field(
                 url_delete = f"{_rest_base_url(store)}/products/{quote(pid)}/images/{quote(image_id)}.json"
                 resp_delete = requests.delete(url_delete, headers=_headers(token), timeout=30)
                 if resp_delete.ok or resp_delete.status_code == 404:
+                    _log_api_table_row("image-delete", "delete_product_image", "DELETE", url_delete, product_id=pid, field_name=field_name, status_code=resp_delete.status_code, outcome="OK", details=f"image_id={image_id}")
                     continue
 
                 msg = f"HTTP {resp_delete.status_code}: {resp_delete.text[:300]}"
+                _log_api_table_row("image-delete", "delete_product_image", "DELETE", url_delete, product_id=pid, field_name=field_name, status_code=resp_delete.status_code, outcome="FAIL", details=msg)
                 if resp_delete.status_code == 429 or "throttle" in msg.lower():
                     time.sleep(wait)
                     wait = min(wait * 2, 32)
@@ -586,6 +751,7 @@ def clear_product_metafield(
             )
             if not resp_list.ok:
                 msg = f"HTTP {resp_list.status_code}: {resp_list.text[:300]}"
+                _log_api_table_row("metafield-delete", "lookup_product_metafield", "GET", url_list, product_id=pid, field_name=field_name, status_code=resp_list.status_code, outcome="FAIL", details=msg)
                 if resp_list.status_code == 429 or "throttle" in msg.lower():
                     time.sleep(wait)
                     wait = min(wait * 2, 32)
@@ -605,11 +771,14 @@ def clear_product_metafield(
             url_delete = f"{_rest_base_url(store)}/metafields/{quote(metafield_id)}.json"
             resp_delete = requests.delete(url_delete, headers=_headers(token), timeout=30)
             if resp_delete.ok:
+                _log_api_table_row("metafield-delete", "delete_product_metafield", "DELETE", url_delete, product_id=pid, field_name=field_name, status_code=resp_delete.status_code, outcome="OK", details=f"metafield_id={metafield_id}")
                 return True, 200, ""
 
             msg = f"HTTP {resp_delete.status_code}: {resp_delete.text[:300]}"
             if resp_delete.status_code == 404:
+                _log_api_table_row("metafield-delete", "delete_product_metafield", "DELETE", url_delete, product_id=pid, field_name=field_name, status_code=resp_delete.status_code, outcome="OK", details=f"metafield_id={metafield_id}")
                 return True, 200, ""
+            _log_api_table_row("metafield-delete", "delete_product_metafield", "DELETE", url_delete, product_id=pid, field_name=field_name, status_code=resp_delete.status_code, outcome="FAIL", details=msg)
             if resp_delete.status_code == 429 or "throttle" in msg.lower():
                 time.sleep(wait)
                 wait = min(wait * 2, 32)
@@ -1236,6 +1405,47 @@ def update_product_api(
                 pass
         time.sleep(wait_secs)
 
+    def _request_logged(
+        method: str,
+        url: str,
+        operation: str,
+        *,
+        variant_id: str = "",
+        field_name: str = "",
+        details: str = "",
+        **kwargs,
+    ) -> requests.Response:
+        _count_request()
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.RequestException as exc:
+            _log_api_table_row(
+                area="rest-write",
+                operation=operation,
+                method=method,
+                endpoint=url,
+                product_id=pid,
+                variant_id=variant_id,
+                field_name=field_name,
+                status_code=0,
+                outcome="EXCEPTION",
+                details=details or str(exc),
+            )
+            raise
+        _log_api_table_row(
+            area="rest-write",
+            operation=operation,
+            method=method,
+            endpoint=url,
+            product_id=pid,
+            variant_id=variant_id,
+            field_name=field_name,
+            status_code=resp.status_code,
+            outcome="OK" if resp.ok else "FAIL",
+            details=details or (resp.text[:300] if not resp.ok else ""),
+        )
+        return resp
+
     def _upsert_owner_metafield(owner_url: str, token_val: str, ns: str, key: str, value: object) -> tuple[bool, int, str]:
         owner_resource = "variant" if "/variants/" in owner_url else "product"
         cache_key = (owner_resource, ns, key)
@@ -1246,9 +1456,13 @@ def update_product_api(
         # Fast path after first verification: try POST directly.
         if cached:
             post_type = cached.get("type") or inferred_type
-            _count_request()
-            resp_post_fast = requests.post(
+            resp_post_fast = _request_logged(
+                "POST",
                 owner_url,
+                f"{owner_resource}_metafield_fast_post",
+                variant_id="" if owner_resource == "product" else _gid_tail(owner_url.rsplit("/", 2)[-2]),
+                field_name=f"{ns}.{key}",
+                details=f"type={post_type}",
                 headers=_headers(token_val),
                 json={
                     "metafield": {
@@ -1267,9 +1481,13 @@ def update_product_api(
                 return False, resp_post_fast.status_code, f"HTTP {resp_post_fast.status_code}: {resp_post_fast.text[:300]}"
 
         # Try to fetch existing metafield first, so we can preserve type.
-        _count_request()
-        resp_get = requests.get(
+        resp_get = _request_logged(
+            "GET",
             owner_url,
+            f"{owner_resource}_metafield_lookup",
+            variant_id="" if owner_resource == "product" else _gid_tail(owner_url.rsplit("/", 2)[-2]),
+            field_name=f"{ns}.{key}",
+            details="lookup existing metafield",
             headers=_headers(token_val),
             params={"namespace": ns, "key": key, "limit": 1},
             timeout=30,
@@ -1287,9 +1505,13 @@ def update_product_api(
                 return False, 0, "Invalid metafield id from Shopify"
 
             url_put = f"{_rest_base_url(store)}/metafields/{quote(mf_id)}.json"
-            _count_request()
-            resp_put = requests.put(
+            resp_put = _request_logged(
+                "PUT",
                 url_put,
+                f"{owner_resource}_metafield_update",
+                variant_id="" if owner_resource == "product" else _gid_tail(owner_url.rsplit("/", 2)[-2]),
+                field_name=f"{ns}.{key}",
+                details=f"type={mf_type}",
                 headers=_headers(token_val),
                 json={"metafield": {"id": mf_id, "value": str(value), "type": mf_type}},
                 timeout=30,
@@ -1302,9 +1524,13 @@ def update_product_api(
         # Create new metafield if not found.
         definition_type = get_metafield_definition_type(store, token_val, owner_type, ns, key)
         create_type = definition_type or inferred_type
-        _count_request()
-        resp_post = requests.post(
+        resp_post = _request_logged(
+            "POST",
             owner_url,
+            f"{owner_resource}_metafield_create",
+            variant_id="" if owner_resource == "product" else _gid_tail(owner_url.rsplit("/", 2)[-2]),
+            field_name=f"{ns}.{key}",
+            details=f"type={create_type}",
             headers=_headers(token_val),
             json={
                 "metafield": {
@@ -1339,9 +1565,12 @@ def update_product_api(
 
             if len(product_input) > 1:
                 url_product = f"{_rest_base_url(store)}/products/{quote(str(pid))}.json"
-                _count_request()
-                resp_prod = requests.put(
+                product_fields = ",".join(sorted(k for k in product_input.keys() if k != "id"))
+                resp_prod = _request_logged(
+                    "PUT",
                     url_product,
+                    "product_update",
+                    details=f"fields={product_fields}",
                     headers=_headers(token),
                     json={"product": product_input},
                     timeout=30,
@@ -1375,9 +1604,13 @@ def update_product_api(
                     if len(one) <= 1:
                         continue
                     url_var = f"{_rest_base_url(store)}/variants/{quote(str(vid))}.json"
-                    _count_request()
-                    resp_var = requests.put(
+                    variant_fields = ",".join(sorted(k for k in one.keys() if k != "id"))
+                    resp_var = _request_logged(
+                        "PUT",
                         url_var,
+                        "variant_update",
+                        variant_id=str(vid),
+                        details=f"fields={variant_fields}",
                         headers=_headers(token),
                         json={"variant": one},
                         timeout=30,
@@ -1434,9 +1667,13 @@ def update_product_api(
                         image_payload["alt"] = alt
 
                     url_img = f"{_rest_base_url(store)}/products/{quote(str(pid))}/images.json"
-                    _count_request()
-                    resp_img = requests.post(
+                    img_source = "src" if src else "attachment"
+                    resp_img = _request_logged(
+                        "POST",
                         url_img,
+                        "product_image_add",
+                        field_name="images",
+                        details=f"source={img_source}",
                         headers=_headers(token),
                         json={"image": image_payload},
                         timeout=45,

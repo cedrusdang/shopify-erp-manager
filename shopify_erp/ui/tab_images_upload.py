@@ -337,12 +337,9 @@ class ImagesUploadTab(ttk.Frame):
 
     def _image_fields_from_headers(self, headers: list[str]) -> list[str]:
         fields: list[str] = []
-        for h in headers:
-            key = (h or "").strip()
-            if not key:
-                continue
-            k = key.lower()
-            if k in {"id", "variants.0.id", "variants.0.sku", "sku"}:
+        for header in headers:
+            key = str(header or "").strip()
+            if not key or not self._is_supported_field(key):
                 continue
             fields.append(key)
         return fields
@@ -357,13 +354,26 @@ class ImagesUploadTab(ttk.Frame):
             wb.close()
         except Exception as exc:
             logger.exception("Failed to load fields from DB")
+            self._field_combo["values"] = []
+            self._field_pick.set("")
+            self._field_combo.config(state="disabled")
             self._log(f"Error loading fields: {exc}")
             return
 
+        self._headers = headers
         fields = self._image_fields_from_headers(headers)
         self._field_combo["values"] = fields
-        if fields and not self._field_pick.get().strip():
+        current = self._field_pick.get().strip()
+        if current in fields:
+            self._field_pick.set(current)
+            self._field_combo.config(state="readonly")
+        elif fields:
             self._field_pick.set(fields[0])
+            self._field_combo.config(state="readonly")
+        else:
+            self._field_pick.set("")
+            self._field_combo.config(state="disabled")
+            self._log("No supported image target fields found in the database header.")
 
     def _select_folder(self) -> None:
         current = self._selected_folder.get().strip()
