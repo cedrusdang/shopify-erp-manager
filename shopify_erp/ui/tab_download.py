@@ -30,6 +30,14 @@ from ..ui.widgets import FieldSelector
 logger = logging.getLogger(__name__)
 
 
+def _needs_metafield_enrichment(fields: list[str]) -> bool:
+    return any(
+        isinstance(field, str)
+        and (field.startswith("metafields.") or ".metafields." in field)
+        for field in fields
+    )
+
+
 class DownloadTab(ttk.Frame):
     def __init__(self, parent: ttk.Notebook, app):
         super().__init__(parent)
@@ -634,7 +642,7 @@ class DownloadTab(ttk.Frame):
                 self._set_progress_step("fetch", "DONE", f"{total} products")
 
                 # Enrich with metafields if any selected field requires them
-                needs_mf = any(".metafields." in f for f in fields)
+                needs_mf = _needs_metafield_enrichment(fields)
                 if needs_mf and products:
                     self._log(f"Fetching metafields for {total} products…")
                     self._set_progress_step("fetch", "RUNNING", "Fetching metafields")
@@ -665,7 +673,35 @@ class DownloadTab(ttk.Frame):
                     chunk = products[start:start + BATCH]
                     for ri, p in enumerate(chunk, start + 2):
                         for ci, f in enumerate(fields, 1):
-                            ws.cell(row=ri, column=ci, value=str(get_by_path(p, f)))
+                            # Attempt primary path, then fallback between product-level
+                            # and variant-level metafield locations when values are empty.
+                            try:
+                                raw_val = get_by_path(p, f)
+                            except Exception:
+                                raw_val = ""
+                            val = raw_val if raw_val not in (None, "") else ""
+
+                            if val == "" and isinstance(f, str) and f.startswith("metafields."):
+                                # Try variant-level metafield (first variant)
+                                alt = f"variants.0.{f}"
+                                try:
+                                    alt_val = get_by_path(p, alt)
+                                    if alt_val not in (None, ""):
+                                        val = alt_val
+                                except Exception:
+                                    pass
+
+                            if val == "" and isinstance(f, str) and f.startswith("variants.0.metafields."):
+                                # Try product-level metafield as fallback
+                                alt = f[len("variants.0."):]
+                                try:
+                                    alt_val = get_by_path(p, alt)
+                                    if alt_val not in (None, ""):
+                                        val = alt_val
+                                except Exception:
+                                    pass
+
+                            ws.cell(row=ri, column=ci, value=str(val))
                     self._app.set_prog_value(min(start + BATCH, total), total)
                     self._app.set_status(
                         f"Writing rows {start + 2}–{min(start + BATCH + 1, total + 1)}…"

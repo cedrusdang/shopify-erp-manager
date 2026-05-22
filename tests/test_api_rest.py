@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import requests
 
 from shopify_erp import api
 
@@ -179,6 +181,73 @@ class TestApiRestHelpers(unittest.TestCase):
         self.assertEqual(actual_page, 3)  # Should return 3, the last available page
         self.assertFalse(has_next)
         self.assertEqual(len(products), 0)  # No products returned since page 5 doesn't exist
+
+    @patch("shopify_erp.api.logger.warning")
+    @patch("shopify_erp.api._log_api_table_row")
+    @patch("shopify_erp.api.requests.Session")
+    def test_enrich_products_with_metafields_logs_http_failures(self, mock_session_cls, mock_log_row, mock_warning):
+        products = [{"id": "9364764164331", "variants": []}]
+
+        response = MagicMock()
+        response.ok = False
+        response.status_code = 403
+        response.text = "forbidden"
+
+        session = MagicMock()
+        session.get.return_value = response
+        mock_session_cls.return_value = session
+
+        api.enrich_products_with_metafields(
+            products,
+            "oz-nails-wa.myshopify.com",
+            "token",
+            ["metafields.custom.ecom_price"],
+        )
+
+        mock_log_row.assert_any_call(
+            area="metafield-read",
+            operation="product_metafield_lookup",
+            method="GET",
+            endpoint="https://oz-nails-wa.myshopify.com/admin/api/2024-10/products/9364764164331/metafields.json",
+            product_id="9364764164331",
+            variant_id="",
+            field_name="metafields.custom.ecom_price",
+            status_code=403,
+            outcome="FAIL",
+            details="HTTP 403: forbidden",
+        )
+        mock_warning.assert_called_once()
+
+    @patch("shopify_erp.api.logger.exception")
+    @patch("shopify_erp.api._log_api_table_row")
+    @patch("shopify_erp.api.requests.Session")
+    def test_enrich_products_with_metafields_logs_exceptions(self, mock_session_cls, mock_log_row, mock_exception):
+        products = [{"id": "9364764164331", "variants": []}]
+
+        session = MagicMock()
+        session.get.side_effect = requests.RequestException("boom")
+        mock_session_cls.return_value = session
+
+        api.enrich_products_with_metafields(
+            products,
+            "oz-nails-wa.myshopify.com",
+            "token",
+            ["metafields.custom.ecom_price"],
+        )
+
+        mock_log_row.assert_any_call(
+            area="metafield-read",
+            operation="product_metafield_read_exception",
+            method="GET",
+            endpoint="https://oz-nails-wa.myshopify.com/admin/api/2024-10/products/9364764164331/metafields.json",
+            product_id="9364764164331",
+            variant_id="",
+            field_name="metafields.*",
+            status_code=0,
+            outcome="EXCEPTION",
+            details="boom",
+        )
+        mock_exception.assert_called_once()
 
 
 if __name__ == "__main__":

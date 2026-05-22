@@ -1,0 +1,3 @@
+timestamp	area	operation	method	endpoint	product_id	variant_id	field_name	status_code	outcome	details
+2026-05-21 10:27:16	auth	fetch_access_token	POST	https://oz-nails-wa.myshopify.com/admin/oauth/access_token				200	OK	store=oz-nails-wa.myshopify.com
+2026-05-21 10:27:16	connection	test_connection	GET	https://oz-nails-wa.myshopify.com/admin/api/2024-10/shop.json				200	OK	OZ Nails WA

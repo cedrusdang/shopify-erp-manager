@@ -29,6 +29,7 @@ from .tab_help     import HelpTab
 from .tab_images_download import ImagesDownloadTab
 from .tab_images_delete import ImagesDeleteTab
 from .tab_images_upload import ImagesUploadTab
+from .tab_images_replacing import ImagesReplacingTab
 from .tab_logs     import LogsTab
 from .tab_shopify_mimic import ShopifyMimicTab
 from .tab_work_logs import WorkLogsTab
@@ -177,6 +178,7 @@ class ShopifyERPApp(tk.Tk):
         self._tab_backup   = BackupTab(nb, self)
         self._tab_images_dl = ImagesDownloadTab(nb, self)
         self._tab_images_up = ImagesUploadTab(nb, self)
+        self._tab_images_replace = ImagesReplacingTab(nb, self)
         self._tab_images_delete = ImagesDeleteTab(nb, self)
         self._tab_mimic    = ShopifyMimicTab(nb, self)
         self._tab_settings = SettingsTab(nb, self)
@@ -197,6 +199,7 @@ class ShopifyERPApp(tk.Tk):
         nb.add(self._tab_upload,   text="  ⬆  Upload  ")
         nb.add(self._tab_images_dl, text="  🖼  Image Download  ")
         nb.add(self._tab_images_up, text="  🖼  Image Upload  ")
+        nb.add(self._tab_images_replace, text="  🖼  Image Replacing  ")
         nb.add(self._tab_images_delete, text="  🗑  Delete Img  ")
         nb.add(self._tab_mimic,    text="  🛍  Shopify Mimic  ")
         nb.add(self._tab_backup,   text="  💾  Backup  ")

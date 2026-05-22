@@ -1248,6 +1248,62 @@ def enrich_products_with_metafields(
     session = requests.Session()
     session.headers.update(_headers(token))
 
+    def _log_metafield_read_failure(
+        operation: str,
+        url: str,
+        *,
+        product_id: str = "",
+        variant_id: str = "",
+        field_name: str = "",
+        response: requests.Response | None = None,
+        exc: Exception | None = None,
+    ) -> None:
+        if response is not None:
+            details = f"HTTP {response.status_code}: {response.text[:300]}"
+            _log_api_table_row(
+                area="metafield-read",
+                operation=operation,
+                method="GET",
+                endpoint=url,
+                product_id=product_id,
+                variant_id=variant_id,
+                field_name=field_name,
+                status_code=response.status_code,
+                outcome="FAIL",
+                details=details,
+            )
+            logger.warning(
+                "Metafield read failed: operation=%s product_id=%s variant_id=%s field=%s status=%s",
+                operation,
+                product_id or "-",
+                variant_id or "-",
+                field_name or "-",
+                response.status_code,
+            )
+            return
+
+        err_text = str(exc) if exc is not None else "Unknown metafield read failure"
+        _log_api_table_row(
+            area="metafield-read",
+            operation=operation,
+            method="GET",
+            endpoint=url,
+            product_id=product_id,
+            variant_id=variant_id,
+            field_name=field_name,
+            status_code=0,
+            outcome="EXCEPTION",
+            details=err_text,
+        )
+        logger.exception(
+            "Metafield read exception: operation=%s product_id=%s variant_id=%s field=%s",
+            operation,
+            product_id or "-",
+            variant_id or "-",
+            field_name or "-",
+            exc_info=exc,
+        )
+
     try:
         for idx, p in enumerate(products):
             pid = str(p.get("id", "")).strip()
@@ -1259,12 +1315,20 @@ def enrich_products_with_metafields(
                     mf_dict: dict = p.setdefault("metafields", {})
                     if use_targeted_product:
                         for ns, key in requested_product_pairs:
+                            url = f"{base}/products/{quote(pid)}/metafields.json"
                             resp = session.get(
-                                f"{base}/products/{quote(pid)}/metafields.json",
+                                url,
                                 params={"namespace": ns, "key": key, "limit": 1},
                                 timeout=20,
                             )
                             if not resp.ok:
+                                _log_metafield_read_failure(
+                                    "product_metafield_lookup",
+                                    url,
+                                    product_id=pid,
+                                    field_name=f"metafields.{ns}.{key}",
+                                    response=resp,
+                                )
                                 continue
                             items = resp.json().get("metafields", [])
                             if not items:
@@ -1273,8 +1337,9 @@ def enrich_products_with_metafields(
                             val = mf.get("value", "")
                             mf_dict.setdefault(ns, {})[key] = val
                     else:
+                        url = f"{base}/products/{quote(pid)}/metafields.json"
                         resp = session.get(
-                            f"{base}/products/{quote(pid)}/metafields.json",
+                            url,
                             params={"limit": 250},
                             timeout=30,
                         )
@@ -1287,8 +1352,22 @@ def enrich_products_with_metafields(
                                 val = mf.get("value", "")
                                 if ns and key:
                                     mf_dict.setdefault(ns, {})[key] = val
-                except Exception:
-                    pass
+                        else:
+                            _log_metafield_read_failure(
+                                "product_metafield_list",
+                                url,
+                                product_id=pid,
+                                field_name="metafields.*",
+                                response=resp,
+                            )
+                except Exception as exc:
+                    _log_metafield_read_failure(
+                        "product_metafield_read_exception",
+                        f"{base}/products/{quote(pid)}/metafields.json",
+                        product_id=pid,
+                        field_name="metafields.*",
+                        exc=exc,
+                    )
 
             if need_variant_mf:
                 variants = p.get("variants") or []
@@ -1302,12 +1381,21 @@ def enrich_products_with_metafields(
                         vmf_dict: dict = v.setdefault("metafields", {})
                         if use_targeted_variant:
                             for ns, key in requested_variant_pairs:
+                                url = f"{base}/variants/{quote(vid)}/metafields.json"
                                 resp = session.get(
-                                    f"{base}/variants/{quote(vid)}/metafields.json",
+                                    url,
                                     params={"namespace": ns, "key": key, "limit": 1},
                                     timeout=20,
                                 )
                                 if not resp.ok:
+                                    _log_metafield_read_failure(
+                                        "variant_metafield_lookup",
+                                        url,
+                                        product_id=pid,
+                                        variant_id=vid,
+                                        field_name=f"variants.0.metafields.{ns}.{key}",
+                                        response=resp,
+                                    )
                                     continue
                                 items = resp.json().get("metafields", [])
                                 if not items:
@@ -1316,8 +1404,9 @@ def enrich_products_with_metafields(
                                 val = mf.get("value", "")
                                 vmf_dict.setdefault(ns, {})[key] = val
                         else:
+                            url = f"{base}/variants/{quote(vid)}/metafields.json"
                             resp = session.get(
-                                f"{base}/variants/{quote(vid)}/metafields.json",
+                                url,
                                 params={"limit": 250},
                                 timeout=30,
                             )
@@ -1330,8 +1419,24 @@ def enrich_products_with_metafields(
                                     val = mf.get("value", "")
                                     if ns and key:
                                         vmf_dict.setdefault(ns, {})[key] = val
-                    except Exception:
-                        pass
+                            else:
+                                _log_metafield_read_failure(
+                                    "variant_metafield_list",
+                                    url,
+                                    product_id=pid,
+                                    variant_id=vid,
+                                    field_name="variants.0.metafields.*",
+                                    response=resp,
+                                )
+                    except Exception as exc:
+                        _log_metafield_read_failure(
+                            "variant_metafield_read_exception",
+                            f"{base}/variants/{quote(vid)}/metafields.json",
+                            product_id=pid,
+                            variant_id=vid,
+                            field_name="variants.0.metafields.*",
+                            exc=exc,
+                        )
     finally:
         try:
             session.close()
